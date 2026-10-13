@@ -1,12 +1,17 @@
 package com.example.ffcapture
 
+import java.io.BufferedOutputStream
+import java.io.File
+import java.io.FileOutputStream
 import java.io.OutputStream
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 
-class PcapWriter(private val out: OutputStream) {
+class PcapWriter(file: File) {
 
+    private val out: OutputStream = BufferedOutputStream(FileOutputStream(file), 1 shl 16)
     private val lock = Any()
+    private var sinceFlush = 0
 
     init {
         val h = ByteBuffer.allocate(24).order(ByteOrder.LITTLE_ENDIAN)
@@ -17,10 +22,7 @@ class PcapWriter(private val out: OutputStream) {
         h.putInt(0)
         h.putInt(65535)
         h.putInt(101)
-        synchronized(lock) {
-            out.write(h.array())
-            out.flush()
-        }
+        synchronized(lock) { out.write(h.array()) }
     }
 
     fun writePacket(data: ByteArray, len: Int, tsMillis: Long) {
@@ -32,14 +34,17 @@ class PcapWriter(private val out: OutputStream) {
         synchronized(lock) {
             out.write(h.array())
             out.write(data, 0, len)
-            out.flush()
+            if (++sinceFlush >= 64) {
+                out.flush()
+                sinceFlush = 0
+            }
         }
     }
 
     fun close() {
         synchronized(lock) {
-            out.flush()
-            out.close()
+            runCatching { out.flush() }
+            runCatching { out.close() }
         }
     }
 }
