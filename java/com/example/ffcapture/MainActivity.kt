@@ -11,6 +11,7 @@ import android.os.Looper
 import android.widget.Button
 import android.widget.LinearLayout
 import android.widget.TextView
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.content.FileProvider
 import java.io.File
@@ -19,7 +20,16 @@ class MainActivity : AppCompatActivity() {
 
     private lateinit var status: TextView
     private lateinit var toggle: Button
+    private lateinit var scopeBtn: Button
     private val ui = Handler(Looper.getMainLooper())
+
+    private val vpnPermission =
+        registerForActivityResult(ActivityResultContracts.StartActivityForResult()) {
+            if (it.resultCode == RESULT_OK) sendAction(CaptureVpnService.ACTION_START, true)
+        }
+
+    private val notifPermission =
+        registerForActivityResult(ActivityResultContracts.RequestPermission()) { }
 
     override fun onCreate(s: Bundle?) {
         super.onCreate(s)
@@ -28,11 +38,14 @@ class MainActivity : AppCompatActivity() {
             orientation = LinearLayout.VERTICAL
             setPadding(48, 96, 48, 48)
         }
-        status = TextView(this).apply { textSize = 15f }
         toggle = Button(this).apply { text = "START CAPTURE" }
-        val scopeBtn = Button(this).apply { text = "SCOPE: FREE FIRE / ALL APPS" }
+        scopeBtn = Button(this).apply { text = scopeLabel() }
         val share = Button(this).apply { text = "SHARE LAST .PCAP" }
         val shareRaw = Button(this).apply { text = "SHARE RAW PAYLOADS (.FFP)" }
+        status = TextView(this).apply {
+            textSize = 14f
+            setPadding(0, 32, 0, 0)
+        }
 
         root.addView(toggle)
         root.addView(scopeBtn)
@@ -42,21 +55,25 @@ class MainActivity : AppCompatActivity() {
         setContentView(root)
 
         if (Build.VERSION.SDK_INT >= 33) {
-            requestPermissions(arrayOf(Manifest.permission.POST_NOTIFICATIONS), 2)
+            notifPermission.launch(Manifest.permission.POST_NOTIFICATIONS)
         }
 
         toggle.setOnClickListener {
-            val prep = VpnService.prepare(this)
-            if (prep != null) {
-                startActivityForResult(prep, 1)
+            if (CaptureState.running) {
+                sendAction(CaptureVpnService.ACTION_STOP, false)
             } else {
-                startService(Intent(this, CaptureVpnService::class.java)
-                    .setAction(CaptureVpnService.ACTION_START))
+                val prep = VpnService.prepare(this)
+                if (prep != null) {
+                    vpnPermission.launch(prep)   // start happens in the callback
+                } else {
+                    sendAction(CaptureVpnService.ACTION_START, true)
+                }
             }
         }
 
         scopeBtn.setOnClickListener {
             CaptureVpnService.onlyFreeFire = !CaptureVpnService.onlyFreeFire
+            scopeBtn.text = scopeLabel()
         }
 
         share.setOnClickListener { share(CaptureState.currentFile, "Share capture") }
@@ -64,6 +81,7 @@ class MainActivity : AppCompatActivity() {
 
         ui.post(object : Runnable {
             override fun run() {
+                toggle.text = if (CaptureState.running) "STOP CAPTURE" else "START CAPTURE"
                 status.text = buildString {
                     append("scope: ${CaptureState.scope}\n")
                     append("packets: ${CaptureState.count}\n")
@@ -73,6 +91,18 @@ class MainActivity : AppCompatActivity() {
                 ui.postDelayed(this, 500)
             }
         })
+    }
+
+    private fun scopeLabel() =
+        if (CaptureVpnService.onlyFreeFire) "SCOPE: FREE FIRE ONLY" else "SCOPE: ALL APPS"
+
+    private fun sendAction(action: String, foreground: Boolean) {
+        val i = Intent(this, CaptureVpnService::class.java).setAction(action)
+        if (foreground && Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            startForegroundService(i)
+        } else {
+            startService(i)
+        }
     }
 
     private fun share(path: String?, label: String) {
