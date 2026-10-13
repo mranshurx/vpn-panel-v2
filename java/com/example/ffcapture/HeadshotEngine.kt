@@ -5,21 +5,23 @@ import android.os.Build
 import kotlin.math.abs
 
 /**
- * Auto headshot engine.
+ * CYBER ENGINE core.
  *
  * FF's UDP body is a position-keyed XOR stream, so a plaintext flag maps to a
- * ciphertext byte at the SAME offset. We learn and rewrite on ciphertext only.
+ * ciphertext byte at the SAME offset. We learn + rewrite on ciphertext only.
  *
- * Learn: BODY corpus -> HEAD corpus -> solve offset + the two ciphertext values.
- * The two values always differ by a constant delta, so only offset + signature +
- * delta need to persist. The live pair is re-derived per session from traffic.
+ * Training: TRAIN HEAD on -> shoot heads; TRAIN BODY on -> shoot bodies.
+ * When both corpora are full it solves, arms and SAVES automatically.
  */
 object HeadshotEngine {
 
-    enum class Phase { IDLE, BODY, HEAD, READY, FAILED }
+    enum class Phase { IDLE, TRAINING, READY, FAILED }
 
     @Volatile var phase = Phase.IDLE
     @Volatile var armed = false
+    @Volatile var trainHead = false
+    @Volatile var trainBody = false
+
     @Volatile var offset = -1
     @Volatile var bodyVal = -1
     @Volatile var headVal = -1
@@ -36,9 +38,9 @@ object HeadshotEngine {
     @Volatile var candidates: List<Candidate> = emptyList()
     @Volatile var chosenIndex = 0
 
-    private const val MIN_SAMPLES = 8
+    private const val MIN_SAMPLES = 12
     private const val BURST_GAP_MS = 200L
-    private const val PREFS = "headshot"
+    private const val PREFS = "cyber_engine"
     private const val LIVE_WINDOW = 300
 
     private val samples = ArrayList<Sample>(8192)
@@ -46,6 +48,9 @@ object HeadshotEngine {
     private var liveSeen = 0
 
     @Volatile private var lastTs = 0L
+    @Volatile private var solving = false
+    private var appCtx: Context? = null
+
     private val logRing = ArrayDeque<String>()
 
     data class Sample(val head: Boolean, val type: Int, val len: Int, val data: ByteArray)
@@ -62,8 +67,9 @@ object HeadshotEngine {
     // ------------------------------------------------------------- restore
 
     fun init(ctx: Context) {
+        appCtx = ctx.applicationContext
         val sp = ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
-        if (sp.getLong("vc", -2L) != versionCode(ctx)) { log("game updated -> needs re-learn"); return }
+        if (sp.getLong("vc", -2L) != versionCode(ctx)) { log("game updated -> retrain"); return }
         val o = sp.getInt("offset", -1)
         if (o < 0) return
         offset = o
@@ -75,7 +81,7 @@ object HeadshotEngine {
         headVal = bodyVal xor delta
         armed = true
         phase = Phase.READY
-        log("restored offset=$offset type=$shotType")
+        log("loaded saved training (offset=$offset)")
     }
 
     private fun versionCode(ctx: Context): Long {
@@ -100,23 +106,29 @@ object HeadshotEngine {
             .apply()
     }
 
-    // ------------------------------------------------------------- learn
+    // ------------------------------------------------------------- training
 
-    fun startLearn() {
-        samples.clear()
-        candidates = emptyList(); chosenIndex = 0
+    /** Exactly one training class at a time. */
+    fun setTrain(head: Boolean, on: Boolean) {
+        if (on) {
+            if (head) { trainHead = true; trainBody = false } else { trainBody = true; trainHead = false }
+            phase = Phase.TRAINING
+            log(if (head) "TRAIN HEAD: shoot bots in the head" else "TRAIN BODY: shoot bots in the body")
+        } else {
+            if (head) trainHead = false else trainBody = false
+            if (!trainHead && !trainBody && !armed) phase = Phase.IDLE
+        }
+    }
+
+    fun reset(ctx: Context) {
+        synchronized(samples) { samples.clear() }
         bodyCount = 0; headCount = 0; patched = 0
-        armed = false
-        phase = Phase.BODY
-        log("step 1: aim at BODY and fire ~15 shots")
+        armed = false; offset = -1; bodyVal = -1; headVal = -1
+        trainHead = false; trainBody = false
+        phase = Phase.IDLE
+        ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit().clear().apply()
+        log("training reset")
     }
-
-    fun beginHeadPhase() {
-        phase = Phase.HEAD
-        log("step 2: aim at HEAD and fire ~15 shots")
-    }
-
-    fun disarm() { armed = false; phase = Phase.IDLE; log("disarmed") }
 
     fun flip() {
         if (bodyVal < 0) return
@@ -132,17 +144,21 @@ object HeadshotEngine {
         log("candidate ${chosenIndex + 1}/${candidates.size} offset=${candidates[chosenIndex].offset}")
     }
 
+    @Synchronized
     fun solve() {
-        val body = samples.filter { !it.head }
-        val head = samples.filter { it.head }
+        val body: List<Sample>; val head: List<Sample>
+        synchronized(samples) {
+            body = samples.filter { !it.head }
+            head = samples.filter { it.head }
+        }
         if (body.size < MIN_SAMPLES || head.size < MIN_SAMPLES) {
             phase = Phase.FAILED
-            log("not enough shots: body=${body.size} head=${head.size}")
+            log("need more shots: body=${body.size} head=${head.size}")
             return
         }
 
         val sigCount = HashMap<Long, Int>()
-        for (s in samples) {
+        for (s in body + head) {
             val key = (s.type.toLong() shl 24) or (s.len and 0xFFFFFF).toLong()
             sigCount.merge(key, 1, Int::plus)
         }
@@ -165,11 +181,11 @@ object HeadshotEngine {
             for (s in bg) bv.merge(s.data[o].toInt() and 0xFF, 1, Int::plus)
             for (s in hg) hv.merge(s.data[o].toInt() and 0xFF, 1, Int::plus)
             val union = bv.keys + hv.keys
-            if (union.size < 2 || union.size > 4) continue          // low-entropy only
+            if (union.size < 2 || union.size > 4) continue
             var tvd = 0.0
             for (v in union) tvd += abs((bv[v] ?: 0).toDouble() / bg.size - (hv[v] ?: 0).toDouble() / hg.size)
             tvd /= 2.0
-            if (tvd < 0.8) continue                                  // must clearly separate
+            if (tvd < 0.8) continue
             val bDom = bv.maxByOrNull { it.value }?.key ?: continue
             val hDom = hv.maxByOrNull { it.value }?.key ?: continue
             if (bDom == hDom) continue
@@ -182,7 +198,9 @@ object HeadshotEngine {
         chosenIndex = 0
         applyCandidate(candidates[0])
         phase = Phase.READY
-        log("SOLVED offset=${candidates[0].offset} score=%.2f".format(candidates[0].score))
+        trainHead = false; trainBody = false
+        appCtx?.let { save(it) }
+        log("TRAINED + SAVED  offset=${candidates[0].offset}  score=%.2f".format(candidates[0].score))
     }
 
     private fun applyCandidate(c: Candidate) {
@@ -206,17 +224,21 @@ object HeadshotEngine {
         lastTs = now
         if (!burst) return
 
-        when (phase) {
-            Phase.BODY -> record(p, len, false)
-            Phase.HEAD -> record(p, len, true)
-            else -> if (armed) liveObserve(p, len)
-        }
+        if (trainHead) record(p, len, true)
+        else if (trainBody) record(p, len, false)
+        else if (armed) liveObserve(p, len)
     }
 
     private fun record(p: ByteArray, len: Int, head: Boolean) {
-        if (samples.size >= 20000) return
-        if (head) headCount++ else bodyCount++
-        samples.add(Sample(head, p[2].toInt() and 0xFF, len, p.copyOf(len)))
+        synchronized(samples) {
+            if (samples.size >= 20000) return
+            if (head) headCount++ else bodyCount++
+            samples.add(Sample(head, p[2].toInt() and 0xFF, len, p.copyOf(len)))
+        }
+        if (!armed && !solving && headCount >= MIN_SAMPLES && bodyCount >= MIN_SAMPLES) {
+            solving = true
+            try { solve() } finally { solving = false }
+        }
     }
 
     private fun liveObserve(p: ByteArray, len: Int) {
@@ -232,7 +254,6 @@ object HeadshotEngine {
         if (ready) { rederive(); synchronized(liveHist) { liveHist.clear(); liveSeen = 0 } }
     }
 
-    /** Keeps the pair valid if the session keystream rotated. */
     private fun rederive() {
         val dom = synchronized(liveHist) { liveHist.maxByOrNull { it.value }?.key } ?: return
         if (dom == bodyVal) return
