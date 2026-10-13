@@ -27,13 +27,18 @@ class CaptureVpnService : VpnService() {
         const val ACTION_STOP  = "STOP"
         private const val CH = "ffcap"
         private const val NOTIF_ID = 1
+
         val FF_PACKAGES = listOf("com.dts.freefireth", "com.dts.freefiremax")
+
+        /** When true, ONLY Free Fire is routed through the VPN. */
+        @Volatile var onlyFreeFire = true
     }
 
     private var tun: ParcelFileDescriptor? = null
     private var tin: FileInputStream? = null
     private var tout: FileOutputStream? = null
     private var pcap: PcapWriter? = null
+    private var dump: PayloadDumper? = null
 
     @Volatile private var running = false
     private val outLock = Any()
@@ -41,7 +46,11 @@ class CaptureVpnService : VpnService() {
     private val udpFlows = ConcurrentHashMap<String, UdpFlow>()
     private val tcpFlows = ConcurrentHashMap<String, TcpFlow>()
 
+    /** TCP inbound rewriting hook. */
     private val transformer: PacketTransformer = NoOpTransformer
+
+    /** UDP payload rewriting hook - this is what edits packets in flight. */
+    private val patcher: UdpPayloadTransformer = FfPatcher()
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         if (intent?.action == ACTION_STOP) {
@@ -65,9 +74,13 @@ class CaptureVpnService : VpnService() {
             .addDnsServer("1.1.1.1")
             .addDnsServer("8.8.8.8")
 
-        val installed = FF_PACKAGES.filter { isInstalled(it) }
+        // Scope the VPN to Free Fire. Empty list == capture everything.
+        val installed = if (onlyFreeFire) FF_PACKAGES.filter { isInstalled(it) } else emptyList()
         if (installed.isNotEmpty()) {
             installed.forEach { b.addAllowedApplication(it) }
+            CaptureState.scope = "Free Fire only"
+        } else {
+            CaptureState.scope = "ALL apps"
         }
 
         val pfd = b.establish()
@@ -82,9 +95,16 @@ class CaptureVpnService : VpnService() {
 
         val dir = File(getExternalFilesDir(null), "captures")
         dir.mkdirs()
-        val f = File(dir, "ff_${System.currentTimeMillis()}.pcap")
+        val base = "ff_${System.currentTimeMillis()}"
+
+        val f = File(dir, "$base.pcap")
         pcap = PcapWriter(FileOutputStream(f))
         CaptureState.currentFile = f.absolutePath
+
+        val d = File(dir, "$base.ffp")
+        dump = PayloadDumper(FileOutputStream(d))
+        CaptureState.currentDumpFile = d.absolutePath
+
         CaptureState.count = 0
 
         running = true
@@ -99,7 +119,34 @@ class CaptureVpnService : VpnService() {
             if (n <= 0) continue
             pcap?.writePacket(buf, n, System.currentTimeMillis())
             CaptureState.count++
+            try { dumpAppPayload(buf, n, Direction.OUTBOUND) } catch (e: Exception) { }
             try { route(buf, n) } catch (e: Exception) { }
+        }
+    }
+
+    /** Strips IP/UDP/TCP headers and dumps only the application bytes. */
+    private fun dumpAppPayload(p: ByteArray, n: Int, dir: Direction) {
+        if (!PacketUtils.isIpv4(p)) return
+        val hl = PacketUtils.ipHeaderLen(p)
+        if (hl < 20 || hl > n) return
+        val end = minOf(PacketUtils.totalLength(p), n)
+        when (PacketUtils.protocol(p)) {
+            PacketUtils.PROTO_UDP -> {
+                val off = hl + 8
+                if (end <= off) return
+                dump?.write(dir, PacketUtils.PROTO_UDP,
+                    PacketUtils.readShort(p, hl), PacketUtils.readShort(p, hl + 2),
+                    p, off, end - off)
+            }
+            PacketUtils.PROTO_TCP -> {
+                if (hl + 20 > n) return
+                val dataOff = ((p[hl + 12].toInt() and 0xF0) shr 4) * 4
+                val off = hl + dataOff
+                if (end <= off) return
+                dump?.write(dir, PacketUtils.PROTO_TCP,
+                    PacketUtils.readShort(p, hl), PacketUtils.readShort(p, hl + 2),
+                    p, off, end - off)
+            }
         }
     }
 
@@ -135,8 +182,10 @@ class CaptureVpnService : VpnService() {
             flow = nf
         }
         val f = flow!!
-        val payload = p.copyOfRange(off, off + len)
-        f.socket.send(DatagramPacket(payload, payload.size))
+        val raw = p.copyOfRange(off, off + len)
+        // skip DNS and low ports; game traffic lives up in the 10k range
+        val out = if (dp >= 1000) patcher.mutate(raw, raw.size, Direction.OUTBOUND) else raw
+        f.socket.send(DatagramPacket(out, out.size))
     }
 
     private fun udpReader(flow: UdpFlow) {
@@ -144,9 +193,14 @@ class CaptureVpnService : VpnService() {
         while (running && !flow.socket.isClosed) {
             val dg = DatagramPacket(rbuf, rbuf.size)
             try { flow.socket.receive(dg) } catch (e: Exception) { break }
+            val raw = rbuf.copyOf(dg.length)
+            dump?.write(Direction.INBOUND, PacketUtils.PROTO_UDP,
+                flow.dstPort, flow.srcPort, raw, 0, raw.size)
+            val out = if (flow.dstPort >= 1000)
+                patcher.mutate(raw, raw.size, Direction.INBOUND) else raw
             var pkt = PacketUtils.buildUdp(
                 flow.dstIp, flow.srcIp, flow.dstPort, flow.srcPort,
-                rbuf, 0, dg.length)
+                out, 0, out.size)
             pkt = transformer.mutate(pkt, pkt.size, Direction.INBOUND)
             pcap?.writePacket(pkt, pkt.size, System.currentTimeMillis())
             writeToTun(pkt)
@@ -240,6 +294,8 @@ class CaptureVpnService : VpnService() {
                 val r = ins.read(buf)
                 if (r < 0) break
                 if (r == 0) continue
+                dump?.write(Direction.INBOUND, PacketUtils.PROTO_TCP,
+                    flow.dstPort, flow.srcPort, buf, 0, r)
                 var pkt = PacketUtils.buildTcp(flow.dstIp, flow.srcIp, flow.dstPort, flow.srcPort,
                     flow.ourSeq, flow.theirSeq, 0x18, buf, 0, r)
                 pkt = transformer.mutate(pkt, pkt.size, Direction.INBOUND)
@@ -287,9 +343,11 @@ class CaptureVpnService : VpnService() {
         udpFlows.clear()
         tcpFlows.clear()
         try { pcap?.close() } catch (e: Exception) { }
+        try { dump?.close() } catch (e: Exception) { }
         try { tun?.close() } catch (e: Exception) { }
         tun = null
         pcap = null
+        dump = null
         tin = null
         tout = null
         stopForeground(STOP_FOREGROUND_REMOVE)
