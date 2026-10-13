@@ -22,7 +22,7 @@ object InputInjector {
         val stub = Class.forName("android.hardware.input.IInputManager\$Stub")
         service = stub.getMethod("asInterface", IBinder::class.java).invoke(null, binder)
         inject = Class.forName("android.hardware.input.IInputManager")
-            .getMethod("injectInputEvent", InputEvent::class.java, Int::class.javaPrimitiveType)
+            .getMethod("injectInputEvent", InputEvent::class.java, Integer.TYPE)
         true
     } catch (e: Throwable) {
         false
