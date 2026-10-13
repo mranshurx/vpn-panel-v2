@@ -5,4 +5,5 @@ object CaptureState {
     @Volatile var currentFile: String? = null
     @Volatile var currentDumpFile: String? = null
     @Volatile var scope = "-"
+    @Volatile var running = false
 }
