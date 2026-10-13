@@ -29,7 +29,7 @@ class AimService : Service() {
         @Volatile var strength = 0.8f      // how much of the gap to close per tick
         @Volatile var radiusFrac = 0.28f   // engage only within this % of width
         @Volatile var deadzone = 4f        // px, ignore tiny errors
-        @Volatile var headBias = 0.12f     // aim slightly below the outline top
+        @Volatile var headBias = 0.10f     // capture px down from the crown
         @Volatile var target = 0xFFFF3B30.toInt()
         @Volatile var tol = 70
 
@@ -46,6 +46,10 @@ class AimService : Service() {
         // one-shot snap request: written by the overlay, consumed by tick()
         @Volatile private var snapping = false
         fun snapNow() { snapping = true }
+
+        // one-shot colour-pick request
+        @Volatile private var pickRequest = false
+        fun pickColour() { pickRequest = true }
     }
 
     private var projection: MediaProjection? = null
@@ -85,6 +89,8 @@ class AimService : Service() {
         val dm = resources.displayMetrics
         realW = dm.widthPixels.toFloat()
         realH = dm.heightPixels.toFloat()
+        // /4 keeps the per-tick pixel scan cheap. Use /3 or /2 if far, thin
+        // outlines keep vanishing (costs CPU: the scan runs on the main thread).
         w = (dm.widthPixels / 4).coerceAtLeast(180)
         h = (dm.heightPixels / 4).coerceAtLeast(320)
         scaleX = realW / w
@@ -123,6 +129,8 @@ class AimService : Service() {
     private fun tick() {
         val px = pixels ?: return
 
+        if (pickRequest) { pickRequest = false; pick() }
+
         // consume a pending SNAP NOW (one-shot)
         val snap = snapping
         snapping = false
@@ -150,7 +158,12 @@ class AimService : Service() {
         aims++
     }
 
-    /** Nearest outline cluster to the crosshair; returns its head point. */
+    /**
+     * Nearest outline cluster to the crosshair; returns the top of its head.
+     *
+     * Colour cannot separate a head from a hand (same colour), so geometry
+     * does it instead: the head is the topmost solid run of the silhouette.
+     */
     private fun findHead(px: IntArray): Pair<Float, Float>? {
         val cell = 4
         val gw = w / cell; val gh = h / cell
@@ -160,28 +173,32 @@ class AimService : Service() {
         val tg = (target shr 8) and 0xFF
         val tb = target and 0xFF
 
+        fun hit(x: Int, y: Int): Boolean {
+            val c = px[y * w + x]
+            val r = (c shr 16) and 0xFF
+            val g = (c shr 8) and 0xFF
+            val b = c and 0xFF
+            return abs(r - tr) <= tol && abs(g - tg) <= tol && abs(b - tb) <= tol
+        }
+
         val grid = BooleanArray(gw * gh)
         var any = false
         for (y in 0 until h) {
-            val row = y * w; val gy = y / cell
+            val gy = y / cell
             for (x in 0 until w) {
-                val c = px[row + x]
-                val r = (c shr 16) and 0xFF
-                val g = (c shr 8) and 0xFF
-                val b = c and 0xFF
-                if (abs(r - tr) <= tol && abs(g - tg) <= tol && abs(b - tb) <= tol) {
-                    grid[gy * gw + x / cell] = true; any = true
-                }
+                if (hit(x, y)) { grid[gy * gw + x / cell] = true; any = true }
             }
         }
         if (!any) return null
 
+        // Pick the cluster nearest the crosshair, with Y squashed so a head
+        // above the crosshair beats a hand stuck out to the side.
         val cx = w / 2; val cy = h / 2
         var best = -1; var bestD = Float.MAX_VALUE
         for (gy in 0 until gh) for (gx in 0 until gw) {
             if (!grid[gy * gw + gx]) continue
             val ddx = (gx * cell + cell / 2) - cx
-            val ddy = (gy * cell + cell / 2) - cy
+            val ddy = ((gy * cell + cell / 2) - cy) * 0.55f
             val d = (ddx * ddx + ddy * ddy).toFloat()
             if (d < bestD) { bestD = d; best = gy * gw + gx }
         }
@@ -204,29 +221,39 @@ class AimService : Service() {
             if (gy - 1 >= 0) { val n = i - gw; if (!seenG[n] && grid[n]) { seenG[n] = true; stack.addLast(n) } }
         }
 
-        val headX = (minX + maxX + 1) * cell / 2f
-        val headY = minY * cell + ((maxY - minY + 1) * cell * headBias)
+        // Walk down from the cluster top and take the centre of the first
+        // solid run — that is the crown of the head.
+        val x0 = (minX * cell).coerceAtLeast(0)
+        val x1 = ((maxX + 1) * cell).coerceAtMost(w)
+        val y0 = (minY * cell).coerceAtLeast(0)
+        val yEnd = (y0 + 12).coerceAtMost((maxY + 1) * cell).coerceAtMost(h)
+
+        var headX = -1f
+        var headY = -1f
+        for (y in y0 until yEnd) {
+            var run = 0; var start = 0; var bestLen = 0; var bestStart = 0
+            for (x in x0 until x1) {
+                if (hit(x, y)) {
+                    if (run == 0) start = x
+                    run++
+                    if (run > bestLen) { bestLen = run; bestStart = start }
+                } else run = 0
+            }
+            if (bestLen >= 2) {
+                headX = bestStart + bestLen / 2f
+                headY = y + headBias * 6f
+                break
+            }
+        }
+
+        if (headX < 0f) {                  // fallback: bbox estimate
+            headX = (minX + maxX + 1) * cell / 2f
+            headY = minY * cell + ((maxY - minY + 1) * cell * headBias)
+        }
         return headX to headY
     }
 
-    private fun notif(): Notification {
-        val nm = getSystemService(NOTIFICATION_SERVICE) as NotificationManager
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            nm.createNotificationChannel(
-                NotificationChannel("cyberaim", "CYBER AIM", NotificationManager.IMPORTANCE_LOW))
-        }
-        return Notification.Builder(this, "cyberaim")
-            .setContentTitle("CYBER AIM")
-            .setSmallIcon(android.R.drawable.ic_menu_view)
-            .setOngoing(true)
-            .build()
-    }
-
-    override fun onDestroy() {
-        runCatching { vd?.release() }
-        runCatching { reader?.close() }
-        runCatching { projection?.stop() }
-        running = false
-        super.onDestroy()
-    }
-}
+    /** Adopt the most saturated pixel near the crosshair as the outline colour. */
+    private fun pick() {
+        val px = pixels ?: return
+        val box = 
