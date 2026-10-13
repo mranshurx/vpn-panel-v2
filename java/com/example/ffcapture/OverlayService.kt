@@ -14,6 +14,9 @@ import android.view.WindowManager
 import android.widget.Button
 import android.widget.LinearLayout
 import android.widget.TextView
+import com.example.ffcapture.net.Headshot
+import com.example.ffcapture.net.Learner
+import com.example.ffcapture.net.PacketVpnService
 
 class OverlayService : Service() {
 
@@ -27,13 +30,14 @@ class OverlayService : Service() {
     private lateinit var content: LinearLayout
     private lateinit var infoText: TextView
     private lateinit var aimBtn: Button
+    private lateinit var pktBtn: Button
+    private lateinit var hsBtn: Button
 
     private var open = false
     private var overlayError = "-"
 
     private val ui = Handler(Looper.getMainLooper())
 
-    // Wrapping ladders so every knob can be dialled both ways.
     private val GAIN     = floatArrayOf(0.2f, 0.3f, 0.4f, 0.6f, 0.8f, 1.0f, 1.2f, 1.5f, 2.0f, 2.5f, 3.0f)
     private val STRENGTH = floatArrayOf(0.2f, 0.3f, 0.4f, 0.5f, 0.6f, 0.7f, 0.8f, 0.9f, 1.0f)
     private val RADIUS   = floatArrayOf(0.05f, 0.08f, 0.12f, 0.18f, 0.25f, 0.35f, 0.45f, 0.6f)
@@ -96,6 +100,16 @@ class OverlayService : Service() {
             rebuild()
         }
         r.addView(aimBtn)
+
+        pktBtn = option("PACKETS: OFF") { togglePackets() }
+        r.addView(pktBtn)
+
+        hsBtn = option("HEADSHOT: OFF") {
+            Headshot.enabled = !Headshot.enabled
+            hsBtn.text = "HEADSHOT: ${if (Headshot.enabled) "ON" else "OFF"}"
+        }
+        r.addView(hsBtn)
+
         r.addView(option("TUNE") { open = !open; rebuild() })
 
         content = LinearLayout(this).apply {
@@ -114,6 +128,19 @@ class OverlayService : Service() {
 
         header.setOnTouchListener(drag())
         return r
+    }
+
+    private fun togglePackets() {
+        if (PacketVpnService.running) {
+            stopService(Intent(this, PacketVpnService::class.java))
+            ui.postDelayed({ pktBtn.text = "PACKETS: OFF" }, 500)
+        } else {
+            // consent needs a real Activity result, so bounce through MainActivity
+            startActivity(Intent(this, MainActivity::class.java)
+                .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_SINGLE_TOP)
+                .putExtra(MainActivity.EXTRA_VPN, true))
+            ui.postDelayed({ pktBtn.text = if (PacketVpnService.running) "PACKETS: ON" else "PACKETS: OFF" }, 900)
+        }
     }
 
     private fun option(label: String, onClick: () -> Unit): Button =
@@ -177,6 +204,10 @@ class OverlayService : Service() {
         }
         content.visibility = View.VISIBLE
 
+        content.addView(small("MEMORY EDITOR") {
+            startActivity(Intent(this, MemoryActivity::class.java)
+                .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
+        })
         content.addView(small("SNAP NOW") { AimService.snapNow() })
         content.addView(small("PICK COLOUR  #%06X".format(AimService.target and 0xFFFFFF)) {
             AimService.pickColour(); rebuild()
@@ -196,6 +227,9 @@ class OverlayService : Service() {
         content.addView(small("HEAD BIAS  %.2f".format(AimService.headBias)) {
             AimService.headBias = next(AimService.headBias, HEADBIAS); rebuild()
         })
+        content.addView(small("CALIBRATE PACKETS") {
+            Learner.clear(); Learner.armed = true
+        })
         content.addView(small("RESET TUNE") {
             AimService.gain = 1f
             AimService.strength = 0.8f
@@ -214,6 +248,8 @@ class OverlayService : Service() {
                 append("target ${AimService.seen}  aims ${AimService.aims}\n")
                 append("d(${AimService.lastDx},${AimService.lastDy})  gain %.2f\n".format(AimService.gain))
                 append("tol ${AimService.tol}\n")
+                append("pkt ${if (PacketVpnService.running) "up" else "down"}  hs ${Headshot.hits.get()}\n")
+                append("samples ${Learner.snapshot().size}\n")
                 append("shizuku ${if (ShizukuHelper.ready) "ok" else "no"}\n")
                 append("ovl ${if (overlayError == "-") "ok" else overlayError}")
             }
