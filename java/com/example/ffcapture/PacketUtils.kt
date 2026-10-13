@@ -1,4 +1,4 @@
-aapackage com.example.ffcapture
+package com.example.ffcapture
 
 object PacketUtils {
     const val PROTO_TCP = 6
