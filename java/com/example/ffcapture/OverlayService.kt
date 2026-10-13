@@ -26,6 +26,7 @@ class OverlayService : Service() {
     private lateinit var header: TextView
     private lateinit var content: LinearLayout
     private lateinit var infoText: TextView
+    private lateinit var aimBtn: Button
 
     private var open = false
     private var overlayError = "-"
@@ -51,7 +52,9 @@ class OverlayService : Service() {
         ).apply { gravity = Gravity.TOP or Gravity.START; x = 30; y = 300 }
 
         overlayError = runCatching { wm?.addView(v, p) }.exceptionOrNull()?.message ?: "-"
-        root = v; lp = p; running = true
+        root = v
+        lp = p
+        running = true
         ui.post(refresh)
     }
 
@@ -65,22 +68,35 @@ class OverlayService : Service() {
             }
             setPadding(18, 12, 18, 12)
         }
+
         header = TextView(this).apply {
             text = "CYBER AIM"
-            setTextColor(0xFF22D3EE.toInt()); textSize = 11f; letterSpacing = 0.14f
-            gravity = Gravity.CENTER; setPadding(0, 2, 0, 10)
+            setTextColor(0xFF22D3EE.toInt())
+            textSize = 11f
+            letterSpacing = 0.14f
+            gravity = Gravity.CENTER
+            setPadding(0, 2, 0, 10)
         }
         r.addView(header)
-        r.addView(option("AIMBOT: ON") { AimService.enabled = !AimService.enabled; rebuild() })
+
+        aimBtn = option("AIMBOT: ON") {
+            AimService.enabled = !AimService.enabled
+            rebuild()
+        }
+        r.addView(aimBtn)
         r.addView(option("TUNE") { open = !open; rebuild() })
 
         content = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL; visibility = View.GONE; setPadding(0, 8, 0, 0)
+            orientation = LinearLayout.VERTICAL
+            visibility = View.GONE
+            setPadding(0, 8, 0, 0)
         }
         r.addView(content)
 
         infoText = TextView(this).apply {
-            setTextColor(0xFFB9E8FF.toInt()); textSize = 10f; setPadding(6, 6, 6, 0)
+            setTextColor(0xFFB9E8FF.toInt())
+            textSize = 10f
+            setPadding(6, 6, 6, 0)
         }
         r.addView(infoText)
 
@@ -90,15 +106,21 @@ class OverlayService : Service() {
 
     private fun option(label: String, onClick: () -> Unit): Button =
         Button(this).apply {
-            text = label; textSize = 12f; setTextColor(0xFFE2F6FF.toInt())
+            text = label
+            textSize = 12f
+            setTextColor(0xFFE2F6FF.toInt())
             background = GradientDrawable().apply {
-                cornerRadius = 18f; setColor(0x3311BBCB); setStroke(2, 0xFF22D3EE.toInt())
+                cornerRadius = 18f
+                setColor(0x3311BBCB)
+                setStroke(2, 0xFF22D3EE.toInt())
             }
-            minWidth = 0; minimumWidth = 0
+            minWidth = 0
+            minimumWidth = 0
             setPadding(18, 6, 18, 6)
             layoutParams = LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.MATCH_PARENT,
-                LinearLayout.LayoutParams.WRAP_CONTENT).apply { topMargin = 6 }
+                LinearLayout.LayoutParams.WRAP_CONTENT
+            ).apply { topMargin = 6 }
             setOnClickListener { onClick() }
         }
 
@@ -106,19 +128,25 @@ class OverlayService : Service() {
         option(label, onClick).apply {
             textSize = 11f
             background = GradientDrawable().apply {
-                cornerRadius = 14f; setColor(0x2200E5FF); setStroke(1, 0x8822D3EE.toInt())
+                cornerRadius = 14f
+                setColor(0x2200E5FF)
+                setStroke(1, 0x8822D3EE.toInt())
             }
         }
 
     private fun drag(): View.OnTouchListener {
-        var dx = 0; var dy = 0
+        var dx = 0
+        var dy = 0
         return View.OnTouchListener { _, e ->
             when (e.action) {
                 MotionEvent.ACTION_DOWN -> {
-                    dx = e.rawX.toInt() - (lp?.x ?: 0); dy = e.rawY.toInt() - (lp?.y ?: 0); true
+                    dx = e.rawX.toInt() - (lp?.x ?: 0)
+                    dy = e.rawY.toInt() - (lp?.y ?: 0)
+                    true
                 }
                 MotionEvent.ACTION_MOVE -> {
-                    lp?.x = e.rawX.toInt() - dx; lp?.y = e.rawY.toInt() - dy
+                    lp?.x = e.rawX.toInt() - dx
+                    lp?.y = e.rawY.toInt() - dy
                     runCatching { root?.let { lp?.let { l -> wm?.updateViewLayout(it, l) } } }
                     true
                 }
@@ -129,11 +157,12 @@ class OverlayService : Service() {
 
     private fun rebuild() {
         content.removeAllViews()
-        (root as LinearLayout).getChildAt(0) // header
-        (header.parent as LinearLayout).getChildAt(1)?.let {
-            (it as Button).text = "AIMBOT: ${if (AimService.enabled) "ON" else "OFF"}"
+        aimBtn.text = "AIMBOT: ${if (AimService.enabled) "ON" else "OFF"}"
+
+        if (!open) {
+            content.visibility = View.GONE
+            return
         }
-        if (!open) { content.visibility = View.GONE; return }
         content.visibility = View.VISIBLE
 
         content.addView(small("SNAP NOW") { AimService.snapNow() })
@@ -153,8 +182,11 @@ class OverlayService : Service() {
             AimService.headBias = (AimService.headBias + 0.04f).coerceAtMost(0.5f); rebuild()
         })
         content.addView(small("RESET TUNE") {
-            AimService.gain = 1f; AimService.strength = 0.8f
-            AimService.radiusFrac = 0.28f; AimService.deadzone = 4f; AimService.headBias = 0.12f
+            AimService.gain = 1f
+            AimService.strength = 0.8f
+            AimService.radiusFrac = 0.28f
+            AimService.deadzone = 4f
+            AimService.headBias = 0.12f
             rebuild()
         })
     }
@@ -176,7 +208,8 @@ class OverlayService : Service() {
     override fun onDestroy() {
         ui.removeCallbacksAndMessages(null)
         runCatching { root?.let { wm?.removeView(it) } }
-        root = null; running = false
+        root = null
+        running = false
         super.onDestroy()
     }
 }
