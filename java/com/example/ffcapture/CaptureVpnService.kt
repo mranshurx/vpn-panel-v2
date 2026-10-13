@@ -25,8 +25,20 @@ class CaptureVpnService : VpnService() {
     companion object {
         const val ACTION_START = "START"
         const val ACTION_STOP  = "STOP"
+
         private const val CH = "ffcap"
         private const val NOTIF_ID = 1
+
+        private const val MTU = 1500
+        private const val MSS = 1400            // keeps IP total <= 1440, under MTU
+
+        private const val UDP_IDLE_MS = 60_000L
+        private const val TCP_IDLE_MS = 180_000L
+
+        private const val SYN = 0x02
+        private const val ACK = 0x10
+        private const val FIN = 0x01
+        private const val RST = 0x04
 
         val FF_PACKAGES = listOf("com.dts.freefireth", "com.dts.freefiremax")
 
@@ -61,6 +73,12 @@ class CaptureVpnService : VpnService() {
         return START_STICKY
     }
 
+    /** Another VPN took over. Tear down instead of leaving a half-dead service. */
+    override fun onRevoke() {
+        shutdown()
+        super.onRevoke()
+    }
+
     private fun startCapture() {
         if (running) return
 
@@ -68,7 +86,7 @@ class CaptureVpnService : VpnService() {
 
         val b = Builder()
             .setSession("FF Capture")
-            .setMtu(1500)
+            .setMtu(MTU)
             .addAddress("10.111.222.1", 32)
             .addRoute("0.0.0.0", 0)
             .addDnsServer("1.1.1.1")
@@ -83,8 +101,9 @@ class CaptureVpnService : VpnService() {
             CaptureState.scope = "ALL apps"
         }
 
-        val pfd = b.establish()
+        val pfd = try { b.establish() } catch (e: Exception) { null }
         if (pfd == null) {
+            CaptureState.scope = "not established"
             stopForeground(STOP_FOREGROUND_REMOVE)
             stopSelf()
             return
@@ -98,29 +117,57 @@ class CaptureVpnService : VpnService() {
         val base = "ff_${System.currentTimeMillis()}"
 
         val f = File(dir, "$base.pcap")
-        pcap = PcapWriter(FileOutputStream(f))
-        CaptureState.currentFile = f.absolutePath
-
         val d = File(dir, "$base.ffp")
-        dump = PayloadDumper(FileOutputStream(d))
+        try {
+            pcap = PcapWriter(f)
+            dump = PayloadDumper(d)
+        } catch (e: Exception) {
+            shutdown()
+            return
+        }
+        CaptureState.currentFile = f.absolutePath
         CaptureState.currentDumpFile = d.absolutePath
-
         CaptureState.count = 0
 
         running = true
+        CaptureState.running = true
         thread(name = "tun-read") { readLoop() }
+        thread(name = "flow-sweeper") { sweepLoop() }
     }
 
     private fun readLoop() {
         val buf = ByteArray(65535)
         val inS = tin ?: return
         while (running) {
-            val n = try { inS.read(buf) } catch (e: Exception) { break }
-            if (n <= 0) continue
+            val n = try { inS.read(buf) } catch (e: Exception) { -1 }
+            if (n < 0) break                    // TUN closed/revoked
+            if (n == 0) continue
             pcap?.writePacket(buf, n, System.currentTimeMillis())
             CaptureState.count++
             try { dumpAppPayload(buf, n, Direction.OUTBOUND) } catch (e: Exception) { }
             try { route(buf, n) } catch (e: Exception) { }
+        }
+        if (running) shutdown()
+    }
+
+    /** Reaps idle flows so sockets/threads don't accumulate forever. */
+    private fun sweepLoop() {
+        while (running) {
+            try { Thread.sleep(5_000) } catch (e: InterruptedException) { break }
+            val now = System.currentTimeMillis()
+
+            for ((k, f) in udpFlows) {
+                if (now - f.lastSeen > UDP_IDLE_MS) {
+                    udpFlows.remove(k)
+                    runCatching { f.socket.close() }
+                }
+            }
+            for ((k, f) in tcpFlows) {
+                if (now - f.lastSeen > TCP_IDLE_MS) {
+                    tcpFlows.remove(k)
+                    runCatching { f.socket.close() }
+                }
+            }
         }
     }
 
@@ -162,15 +209,19 @@ class CaptureVpnService : VpnService() {
 
     private fun handleUdp(p: ByteArray, n: Int) {
         val hl = PacketUtils.ipHeaderLen(p)
+        if (hl < 20 || hl > n) return
+        val total = minOf(PacketUtils.totalLength(p), n)
+        if (total < hl + 8) return
+
         val srcIp = PacketUtils.readInt(p, 12)
         val dstIp = PacketUtils.readInt(p, 16)
         val sp = PacketUtils.readShort(p, hl)
         val dp = PacketUtils.readShort(p, hl + 2)
         val off = hl + 8
-        val len = PacketUtils.totalLength(p) - hl - 8
-        if (len <= 0) return
+        val len = total - off
+        if (len < 0) return
 
-        val key = "$srcIp:$sp"
+        val key = "$srcIp:$sp-$dstIp:$dp"
         var flow = udpFlows[key]
         if (flow == null) {
             val sock = DatagramSocket()
@@ -178,21 +229,25 @@ class CaptureVpnService : VpnService() {
             sock.connect(InetAddress.getByAddress(PacketUtils.toBytes(dstIp)), dp)
             val nf = UdpFlow(sock, srcIp, sp, dstIp, dp)
             udpFlows[key] = nf
-            thread { udpReader(nf) }
+            thread { udpReader(nf, key) }
             flow = nf
         }
         val f = flow!!
+        f.lastSeen = System.currentTimeMillis()
+
         val raw = p.copyOfRange(off, off + len)
         // skip DNS and low ports; game traffic lives up in the 10k range
         val out = if (dp >= 1000) patcher.mutate(raw, raw.size, Direction.OUTBOUND) else raw
-        f.socket.send(DatagramPacket(out, out.size))
+        runCatching { f.socket.send(DatagramPacket(out, out.size)) }
     }
 
-    private fun udpReader(flow: UdpFlow) {
+    private fun udpReader(flow: UdpFlow, key: String) {
         val rbuf = ByteArray(65535)
         while (running && !flow.socket.isClosed) {
             val dg = DatagramPacket(rbuf, rbuf.size)
             try { flow.socket.receive(dg) } catch (e: Exception) { break }
+            flow.lastSeen = System.currentTimeMillis()
+
             val raw = rbuf.copyOf(dg.length)
             dump?.write(Direction.INBOUND, PacketUtils.PROTO_UDP,
                 flow.dstPort, flow.srcPort, raw, 0, raw.size)
@@ -205,81 +260,113 @@ class CaptureVpnService : VpnService() {
             pcap?.writePacket(pkt, pkt.size, System.currentTimeMillis())
             writeToTun(pkt)
         }
+        udpFlows.remove(key)
     }
 
     // ---------------- TCP ----------------
 
     private fun handleTcp(p: ByteArray, n: Int) {
         val hl = PacketUtils.ipHeaderLen(p)
+        if (hl < 20 || hl > n) return
+        val total = minOf(PacketUtils.totalLength(p), n)
+
         val srcIp = PacketUtils.readInt(p, 12)
         val dstIp = PacketUtils.readInt(p, 16)
         val sp = PacketUtils.readShort(p, hl)
         val dp = PacketUtils.readShort(p, hl + 2)
         val seq = PacketUtils.readInt(p, hl + 4)
+        val ackNum = PacketUtils.readInt(p, hl + 8)
+        if (hl + 20 > n) return
         val dataOff = ((p[hl + 12].toInt() and 0xF0) shr 4) * 4
         val flags = p[hl + 13].toInt() and 0xFF
         val poff = hl + dataOff
-        val plen = PacketUtils.totalLength(p) - hl - dataOff
-
-        val SYN = 0x02
-        val ACK = 0x10
-        val FIN = 0x01
-        val RST = 0x04
+        val plen = total - poff
 
         val key = "$srcIp:$sp-$dstIp:$dp"
 
+        // ---- SYN (no ACK): open the real socket, exactly once per flow ----
         if ((flags and SYN) != 0 && (flags and ACK) == 0) {
+            if (tcpFlows.containsKey(key)) return   // retransmitted SYN while connecting
             val sock = Socket()
             protect(sock)
             val flow = TcpFlow(sock, srcIp, sp, dstIp, dp)
             flow.theirSeq = seq + 1
             tcpFlows[key] = flow
-            thread {
-                try {
-                    sock.connect(InetSocketAddress(
-                        InetAddress.getByAddress(PacketUtils.toBytes(dstIp)), dp), 8000)
-                    flow.established = true
-                    val synack = PacketUtils.buildTcp(dstIp, srcIp, dp, sp,
-                        flow.ourSeq, flow.theirSeq, SYN or ACK, null, 0, 0)
-                    flow.ourSeq++
-                    writeToTun(synack)
-                    tcpServerReader(flow, key)
-                } catch (e: Exception) {
-                    val rst = PacketUtils.buildTcp(dstIp, srcIp, dp, sp,
-                        flow.ourSeq, flow.theirSeq, RST or ACK, null, 0, 0)
-                    writeToTun(rst)
-                    tcpFlows.remove(key)
-                }
+            thread { tcpConnect(flow, key) }
+            return
+        }
+
+        val flow = tcpFlows[key]
+
+        // ---- unknown flow: RST so the client fails fast instead of hanging ----
+        if (flow == null) {
+            if ((flags and RST) == 0) {
+                val rstSeq = if ((flags and ACK) != 0) ackNum else 0
+                val ackNo = if ((flags and ACK) != 0) 0
+                            else seq + plen + (if ((flags and (SYN or FIN)) != 0) 1 else 0)
+                writeToTun(PacketUtils.buildTcp(dstIp, srcIp, dp, sp,
+                    rstSeq, ackNo, RST or ACK, null, 0, 0))
             }
             return
         }
 
-        val flow = tcpFlows[key] ?: return
+        flow.lastSeen = System.currentTimeMillis()
 
         if ((flags and RST) != 0) {
-            try { flow.socket.close() } catch (e: Exception) { }
+            runCatching { flow.socket.close() }
             tcpFlows.remove(key)
             return
         }
 
         if (plen > 0) {
             if (seq != flow.theirSeq) {
+                // gap or duplicate: cumulative ACK, let the peer recover
                 sendAck(flow, ACK, dstIp, srcIp, dp, sp)
                 return
             }
-            try { flow.socket.getOutputStream().write(p, poff, plen) } catch (e: Exception) { }
+            if (!writeToSocket(flow, p, poff, plen)) {
+                // socket not ready - don't ACK, peer will retransmit
+                return
+            }
             flow.theirSeq += plen
             sendAck(flow, ACK, dstIp, srcIp, dp, sp)
         }
 
         if ((flags and FIN) != 0) {
             flow.theirSeq++
-            sendAck(flow, ACK or FIN, dstIp, srcIp, dp, sp)
-            flow.ourSeq++
-            try { flow.socket.close() } catch (e: Exception) { }
-            tcpFlows.remove(key)
+            sendAck(flow, ACK, dstIp, srcIp, dp, sp)
+            runCatching { flow.socket.shutdownOutput() }   // half-close, keep reading
+            flow.clientFin = true
+            if (flow.serverDone) {
+                runCatching { flow.socket.close() }
+                tcpFlows.remove(key)
+            }
         }
     }
+
+    private fun tcpConnect(flow: TcpFlow, key: String) {
+        try {
+            flow.socket.connect(InetSocketAddress(
+                InetAddress.getByAddress(PacketUtils.toBytes(flow.dstIp)), flow.dstPort), 8000)
+        } catch (e: Exception) {
+            writeToTun(PacketUtils.buildTcp(flow.dstIp, flow.srcIp, flow.dstPort, flow.srcPort,
+                flow.ourSeq, flow.theirSeq, RST or ACK, null, 0, 0))
+            tcpFlows.remove(key)
+            return
+        }
+        flow.established = true
+        writeToTun(PacketUtils.buildTcp(flow.dstIp, flow.srcIp, flow.dstPort, flow.srcPort,
+            flow.ourSeq, flow.theirSeq, SYN or ACK, null, 0, 0, MSS))
+        flow.ourSeq++
+        tcpServerReader(flow, key)
+    }
+
+    private fun writeToSocket(flow: TcpFlow, p: ByteArray, off: Int, len: Int): Boolean = try {
+        val os = flow.socket.getOutputStream()
+        os.write(p, off, len)
+        os.flush()
+        true
+    } catch (e: Exception) { false }
 
     private fun sendAck(flow: TcpFlow, flags: Int, srcIp: Int, dstIp: Int, sp: Int, dp: Int) {
         writeToTun(PacketUtils.buildTcp(srcIp, dstIp, sp, dp,
@@ -287,13 +374,15 @@ class CaptureVpnService : VpnService() {
     }
 
     private fun tcpServerReader(flow: TcpFlow, key: String) {
-        val buf = ByteArray(16 * 1024)
+        val buf = ByteArray(MSS)
+        var closed = false
         try {
             val ins = flow.socket.getInputStream()
             while (running && !flow.socket.isClosed) {
                 val r = ins.read(buf)
-                if (r < 0) break
+                if (r < 0) { closed = true; break }
                 if (r == 0) continue
+                flow.lastSeen = System.currentTimeMillis()
                 dump?.write(Direction.INBOUND, PacketUtils.PROTO_TCP,
                     flow.dstPort, flow.srcPort, buf, 0, r)
                 var pkt = PacketUtils.buildTcp(flow.dstIp, flow.srcIp, flow.dstPort, flow.srcPort,
@@ -303,15 +392,26 @@ class CaptureVpnService : VpnService() {
                 pcap?.writePacket(pkt, pkt.size, System.currentTimeMillis())
                 writeToTun(pkt)
             }
-        } catch (e: Exception) { }
-        tcpFlows.remove(key)
+        } catch (e: Exception) { closed = true }
+
+        if (closed && running) {
+            // THE fix: propagate the server's FIN to the client so it stops waiting
+            writeToTun(PacketUtils.buildTcp(flow.dstIp, flow.srcIp, flow.dstPort, flow.srcPort,
+                flow.ourSeq, flow.theirSeq, FIN or ACK, null, 0, 0))
+            flow.ourSeq++
+            flow.serverDone = true
+            if (flow.clientFin) {
+                runCatching { flow.socket.close() }
+                tcpFlows.remove(key)
+            }
+        }
     }
 
     // ---------------- plumbing ----------------
 
     private fun writeToTun(pkt: ByteArray) {
         val o = tout ?: return
-        synchronized(outLock) { try { o.write(pkt) } catch (e: Exception) { } }
+        synchronized(outLock) { runCatching { o.write(pkt) } }
     }
 
     private fun isInstalled(pkg: String) =
@@ -327,30 +427,40 @@ class CaptureVpnService : VpnService() {
             this, 0,
             Intent(this, MainActivity::class.java),
             PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT)
+        val stopPi = PendingIntent.getService(
+            this, 1,
+            Intent(this, CaptureVpnService::class.java).setAction(ACTION_STOP),
+            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT)
         return NotificationCompat.Builder(this, CH)
             .setContentTitle("FF Capture")
             .setContentText(text)
             .setSmallIcon(android.R.drawable.stat_sys_download)
             .setContentIntent(pi)
+            .addAction(0, "Stop", stopPi)
             .setOngoing(true)
             .build()
     }
 
     private fun shutdown() {
         running = false
-        udpFlows.values.forEach { try { it.socket.close() } catch (e: Exception) { } }
-        tcpFlows.values.forEach { try { it.socket.close() } catch (e: Exception) { } }
+        CaptureState.running = false
+
+        udpFlows.values.forEach { runCatching { it.socket.close() } }
+        tcpFlows.values.forEach { runCatching { it.socket.close() } }
         udpFlows.clear()
         tcpFlows.clear()
-        try { pcap?.close() } catch (e: Exception) { }
-        try { dump?.close() } catch (e: Exception) { }
-        try { tun?.close() } catch (e: Exception) { }
+
+        runCatching { pcap?.close() }
+        runCatching { dump?.close() }
+        runCatching { tun?.close() }
+
         tun = null
         pcap = null
         dump = null
         tin = null
         tout = null
-        stopForeground(STOP_FOREGROUND_REMOVE)
+
+        runCatching { stopForeground(STOP_FOREGROUND_REMOVE) }
         stopSelf()
     }
 
@@ -360,12 +470,17 @@ class CaptureVpnService : VpnService() {
     }
 
     class UdpFlow(val socket: DatagramSocket, val srcIp: Int, val srcPort: Int,
-                  val dstIp: Int, val dstPort: Int)
+                  val dstIp: Int, val dstPort: Int) {
+        @Volatile var lastSeen = System.currentTimeMillis()
+    }
 
     class TcpFlow(val socket: Socket, val srcIp: Int, val srcPort: Int,
                   val dstIp: Int, val dstPort: Int) {
         @Volatile var ourSeq = (Math.random() * Int.MAX_VALUE).toInt()
         @Volatile var theirSeq = 0
         @Volatile var established = false
+        @Volatile var clientFin = false
+        @Volatile var serverDone = false
+        @Volatile var lastSeen = System.currentTimeMillis()
     }
 }
