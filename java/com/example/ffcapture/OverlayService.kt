@@ -2,7 +2,6 @@ package com.example.ffcapture
 
 import android.app.Service
 import android.content.Intent
-import android.graphics.Color
 import android.graphics.PixelFormat
 import android.graphics.drawable.GradientDrawable
 import android.os.Handler
@@ -28,7 +27,8 @@ class OverlayService : Service() {
     private lateinit var header: TextView
     private lateinit var content: LinearLayout
 
-    private var section = 0   // 0 none, 1 aim, 2 setup, 3 info
+    private var section = 0
+    private var overlayError = "-"
 
     private var trainHeadBtn: Button? = null
     private var trainBodyBtn: Button? = null
@@ -54,13 +54,13 @@ class OverlayService : Service() {
             WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE,
             PixelFormat.TRANSLUCENT
         ).apply { gravity = Gravity.TOP or Gravity.START; x = 30; y = 260 }
-        runCatching { wm?.addView(v, p) }
+
+        val err = runCatching { wm?.addView(v, p) }.exceptionOrNull()
+        overlayError = err?.message ?: "-"
         root = v; lp = p
         running = true
         ui.post(refresh)
     }
-
-    // ------------------------------------------------------------- build
 
     private fun build(): View {
         val r = LinearLayout(this).apply {
@@ -82,7 +82,6 @@ class OverlayService : Service() {
             setPadding(0, 2, 0, 10)
         }
         r.addView(header)
-
         r.addView(option("AIM & LOCATION") { toggle(1) })
         r.addView(option("SETUP") { toggle(2) })
         r.addView(option("INFO") { toggle(3) })
@@ -93,7 +92,6 @@ class OverlayService : Service() {
             setPadding(0, 8, 0, 0)
         }
         r.addView(content)
-
         header.setOnTouchListener(drag())
         return r
     }
@@ -104,9 +102,7 @@ class OverlayService : Service() {
             textSize = 12f
             setTextColor(0xFFE2F6FF.toInt())
             background = GradientDrawable().apply {
-                cornerRadius = 18f
-                setColor(0x3311BBCB)
-                setStroke(2, 0xFF22D3EE.toInt())
+                cornerRadius = 18f; setColor(0x3311BBCB); setStroke(2, 0xFF22D3EE.toInt())
             }
             minWidth = 0; minimumWidth = 0
             setPadding(18, 6, 18, 6)
@@ -121,9 +117,7 @@ class OverlayService : Service() {
         option(label, onClick).apply {
             textSize = 11f
             background = GradientDrawable().apply {
-                cornerRadius = 14f
-                setColor(0x2200E5FF)
-                setStroke(1, 0x8822D3EE.toInt())
+                cornerRadius = 14f; setColor(0x2200E5FF); setStroke(1, 0x8822D3EE.toInt())
             }
         }
 
@@ -132,13 +126,10 @@ class OverlayService : Service() {
         return View.OnTouchListener { _, e ->
             when (e.action) {
                 MotionEvent.ACTION_DOWN -> {
-                    dx = e.rawX.toInt() - (lp?.x ?: 0)
-                    dy = e.rawY.toInt() - (lp?.y ?: 0)
-                    true
+                    dx = e.rawX.toInt() - (lp?.x ?: 0); dy = e.rawY.toInt() - (lp?.y ?: 0); true
                 }
                 MotionEvent.ACTION_MOVE -> {
-                    lp?.x = e.rawX.toInt() - dx
-                    lp?.y = e.rawY.toInt() - dy
+                    lp?.x = e.rawX.toInt() - dx; lp?.y = e.rawY.toInt() - dy
                     runCatching { root?.let { lp?.let { l -> wm?.updateViewLayout(it, l) } } }
                     true
                 }
@@ -147,12 +138,7 @@ class OverlayService : Service() {
         }
     }
 
-    // ------------------------------------------------------------- sections
-
-    private fun toggle(s: Int) {
-        section = if (section == s) 0 else s
-        rebuild()
-    }
+    private fun toggle(s: Int) { section = if (section == s) 0 else s; rebuild() }
 
     private fun rebuild() {
         trainHeadBtn = null; trainBodyBtn = null; armBtn = null; infoText = null
@@ -162,33 +148,24 @@ class OverlayService : Service() {
 
         when (section) {
             1 -> {
-                armBtn = small("") {
-                    HeadshotEngine.armed = !HeadshotEngine.armed
-                    refreshTexts()
-                }
+                armBtn = small("") { HeadshotEngine.armed = !HeadshotEngine.armed; refreshTexts() }
                 content.addView(armBtn)
                 content.addView(small("FLIP B/H") { HeadshotEngine.flip() })
+                content.addView(small("OFFSET -1") { HeadshotEngine.nudge(-1) })
+                content.addView(small("OFFSET +1") { HeadshotEngine.nudge(1) })
                 content.addView(small("NEXT CANDIDATE") { HeadshotEngine.nextCandidate() })
                 content.addView(small("RESET TRAINING") { HeadshotEngine.reset(this) })
             }
             2 -> {
-                trainHeadBtn = small("") {
-                    HeadshotEngine.setTrain(head = true, on = !HeadshotEngine.trainHead)
-                    refreshTexts()
-                }
-                trainBodyBtn = small("") {
-                    HeadshotEngine.setTrain(head = false, on = !HeadshotEngine.trainBody)
-                    refreshTexts()
-                }
+                trainHeadBtn = small("") { HeadshotEngine.setTrain(true, !HeadshotEngine.trainHead); refreshTexts() }
+                trainBodyBtn = small("") { HeadshotEngine.setTrain(false, !HeadshotEngine.trainBody); refreshTexts() }
                 content.addView(trainHeadBtn)
                 content.addView(trainBodyBtn)
                 content.addView(small("SOLVE NOW") { HeadshotEngine.solve() })
             }
             3 -> {
                 infoText = TextView(this).apply {
-                    setTextColor(0xFFB9E8FF.toInt())
-                    textSize = 10f
-                    setPadding(6, 4, 6, 4)
+                    setTextColor(0xFFB9E8FF.toInt()); textSize = 10f; setPadding(6, 4, 6, 4)
                 }
                 content.addView(infoText)
             }
@@ -203,13 +180,15 @@ class OverlayService : Service() {
         trainBodyBtn?.text = "TRAIN BODY: ${onOff(HeadshotEngine.trainBody)}"
         armBtn?.text = "ARM: ${onOff(HeadshotEngine.armed)}"
         infoText?.text = buildString {
-            append("phase: ${HeadshotEngine.phase}\n")
-            append("armed: ${HeadshotEngine.armed}\n")
-            append("offset: ${HeadshotEngine.offset}\n")
-            append("body=0x%02x head=0x%02x\n".format(HeadshotEngine.bodyVal, HeadshotEngine.headVal))
-            append("shots b/h: ${HeadshotEngine.bodyCount}/${HeadshotEngine.headCount}\n")
-            append("patched: ${HeadshotEngine.patched}\n")
-            append("scope: ${CaptureState.scope}")
+            append("phase ${HeadshotEngine.phase}  armed ${HeadshotEngine.armed}\n")
+            append("pkt seen ${HeadshotEngine.seenOut}  shot ${HeadshotEngine.seenShot}\n")
+            append("patched ${HeadshotEngine.patched}\n")
+            append("off ${HeadshotEngine.offset} b=0x%02x h=0x%02x\n".format(HeadshotEngine.bodyVal, HeadshotEngine.headVal))
+            append("samples b/h ${HeadshotEngine.bodyCount}/${HeadshotEngine.headCount}\n")
+            append("err ${HeadshotEngine.lastError}\n")
+            append("ovl ${if (overlayError == "-") "ok" else overlayError}\n")
+            append("---\n")
+            append(HeadshotEngine.logs().takeLast(6).joinToString("\n"))
         }
         header.text = when {
             HeadshotEngine.trainHead || HeadshotEngine.trainBody -> "CYBER ENGINE · TRAIN"
@@ -225,8 +204,7 @@ class OverlayService : Service() {
     override fun onDestroy() {
         ui.removeCallbacksAndMessages(null)
         runCatching { root?.let { wm?.removeView(it) } }
-        root = null
-        running = false
+        root = null; running = false
         super.onDestroy()
     }
 }
