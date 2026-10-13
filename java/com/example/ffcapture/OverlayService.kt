@@ -15,7 +15,6 @@ import android.widget.Button
 import android.widget.LinearLayout
 import android.widget.TextView
 
-/** Floating CYBER ENGINE menu drawn over the game. */
 class OverlayService : Service() {
 
     companion object { @Volatile var running = false }
@@ -26,20 +25,16 @@ class OverlayService : Service() {
 
     private lateinit var header: TextView
     private lateinit var content: LinearLayout
+    private lateinit var infoText: TextView
 
-    private var section = 0
+    private var open = false
     private var overlayError = "-"
-
-    private var trainHeadBtn: Button? = null
-    private var trainBodyBtn: Button? = null
-    private var armBtn: Button? = null
-    private var infoText: TextView? = null
 
     private val ui = Handler(Looper.getMainLooper())
 
-    override fun onBind(intent: Intent?): IBinder? = null
+    override fun onBind(i: Intent?): IBinder? = null
 
-    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+    override fun onStartCommand(i: Intent?, f: Int, s: Int): Int {
         if (root == null) show()
         return START_STICKY
     }
@@ -53,12 +48,10 @@ class OverlayService : Service() {
             WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
             WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE,
             PixelFormat.TRANSLUCENT
-        ).apply { gravity = Gravity.TOP or Gravity.START; x = 30; y = 260 }
+        ).apply { gravity = Gravity.TOP or Gravity.START; x = 30; y = 300 }
 
-        val err = runCatching { wm?.addView(v, p) }.exceptionOrNull()
-        overlayError = err?.message ?: "-"
-        root = v; lp = p
-        running = true
+        overlayError = runCatching { wm?.addView(v, p) }.exceptionOrNull()?.message ?: "-"
+        root = v; lp = p; running = true
         ui.post(refresh)
     }
 
@@ -72,35 +65,32 @@ class OverlayService : Service() {
             }
             setPadding(18, 12, 18, 12)
         }
-
         header = TextView(this).apply {
-            text = "CYBER ENGINE"
-            setTextColor(0xFF22D3EE.toInt())
-            textSize = 11f
-            letterSpacing = 0.14f
-            gravity = Gravity.CENTER
-            setPadding(0, 2, 0, 10)
+            text = "CYBER AIM"
+            setTextColor(0xFF22D3EE.toInt()); textSize = 11f; letterSpacing = 0.14f
+            gravity = Gravity.CENTER; setPadding(0, 2, 0, 10)
         }
         r.addView(header)
-        r.addView(option("AIM & LOCATION") { toggle(1) })
-        r.addView(option("SETUP") { toggle(2) })
-        r.addView(option("INFO") { toggle(3) })
+        r.addView(option("AIMBOT: ON") { AimService.enabled = !AimService.enabled; rebuild() })
+        r.addView(option("TUNE") { open = !open; rebuild() })
 
         content = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            visibility = View.GONE
-            setPadding(0, 8, 0, 0)
+            orientation = LinearLayout.VERTICAL; visibility = View.GONE; setPadding(0, 8, 0, 0)
         }
         r.addView(content)
+
+        infoText = TextView(this).apply {
+            setTextColor(0xFFB9E8FF.toInt()); textSize = 10f; setPadding(6, 6, 6, 0)
+        }
+        r.addView(infoText)
+
         header.setOnTouchListener(drag())
         return r
     }
 
     private fun option(label: String, onClick: () -> Unit): Button =
         Button(this).apply {
-            text = label
-            textSize = 12f
-            setTextColor(0xFFE2F6FF.toInt())
+            text = label; textSize = 12f; setTextColor(0xFFE2F6FF.toInt())
             background = GradientDrawable().apply {
                 cornerRadius = 18f; setColor(0x3311BBCB); setStroke(2, 0xFF22D3EE.toInt())
             }
@@ -108,8 +98,7 @@ class OverlayService : Service() {
             setPadding(18, 6, 18, 6)
             layoutParams = LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.MATCH_PARENT,
-                LinearLayout.LayoutParams.WRAP_CONTENT
-            ).apply { topMargin = 6 }
+                LinearLayout.LayoutParams.WRAP_CONTENT).apply { topMargin = 6 }
             setOnClickListener { onClick() }
         }
 
@@ -138,67 +127,50 @@ class OverlayService : Service() {
         }
     }
 
-    private fun toggle(s: Int) { section = if (section == s) 0 else s; rebuild() }
-
     private fun rebuild() {
-        trainHeadBtn = null; trainBodyBtn = null; armBtn = null; infoText = null
         content.removeAllViews()
-        if (section == 0) { content.visibility = View.GONE; return }
+        (root as LinearLayout).getChildAt(0) // header
+        (header.parent as LinearLayout).getChildAt(1)?.let {
+            (it as Button).text = "AIMBOT: ${if (AimService.enabled) "ON" else "OFF"}"
+        }
+        if (!open) { content.visibility = View.GONE; return }
         content.visibility = View.VISIBLE
 
-        when (section) {
-            1 -> {
-                armBtn = small("") { HeadshotEngine.armed = !HeadshotEngine.armed; refreshTexts() }
-                content.addView(armBtn)
-                content.addView(small("FLIP B/H") { HeadshotEngine.flip() })
-                content.addView(small("OFFSET -1") { HeadshotEngine.nudge(-1) })
-                content.addView(small("OFFSET +1") { HeadshotEngine.nudge(1) })
-                content.addView(small("NEXT CANDIDATE") { HeadshotEngine.nextCandidate() })
-                content.addView(small("RESET TRAINING") { HeadshotEngine.reset(this) })
-            }
-            2 -> {
-                trainHeadBtn = small("") { HeadshotEngine.setTrain(true, !HeadshotEngine.trainHead); refreshTexts() }
-                trainBodyBtn = small("") { HeadshotEngine.setTrain(false, !HeadshotEngine.trainBody); refreshTexts() }
-                content.addView(trainHeadBtn)
-                content.addView(trainBodyBtn)
-                content.addView(small("SOLVE NOW") { HeadshotEngine.solve() })
-            }
-            3 -> {
-                infoText = TextView(this).apply {
-                    setTextColor(0xFFB9E8FF.toInt()); textSize = 10f; setPadding(6, 4, 6, 4)
-                }
-                content.addView(infoText)
-            }
-        }
-        refreshTexts()
-    }
-
-    private fun onOff(b: Boolean) = if (b) "ON" else "OFF"
-
-    private fun refreshTexts() {
-        trainHeadBtn?.text = "TRAIN HEAD: ${onOff(HeadshotEngine.trainHead)}"
-        trainBodyBtn?.text = "TRAIN BODY: ${onOff(HeadshotEngine.trainBody)}"
-        armBtn?.text = "ARM: ${onOff(HeadshotEngine.armed)}"
-        infoText?.text = buildString {
-            append("phase ${HeadshotEngine.phase}  armed ${HeadshotEngine.armed}\n")
-            append("pkt seen ${HeadshotEngine.seenOut}  shot ${HeadshotEngine.seenShot}\n")
-            append("patched ${HeadshotEngine.patched}\n")
-            append("off ${HeadshotEngine.offset} b=0x%02x h=0x%02x\n".format(HeadshotEngine.bodyVal, HeadshotEngine.headVal))
-            append("samples b/h ${HeadshotEngine.bodyCount}/${HeadshotEngine.headCount}\n")
-            append("err ${HeadshotEngine.lastError}\n")
-            append("ovl ${if (overlayError == "-") "ok" else overlayError}\n")
-            append("---\n")
-            append(HeadshotEngine.logs().takeLast(6).joinToString("\n"))
-        }
-        header.text = when {
-            HeadshotEngine.trainHead || HeadshotEngine.trainBody -> "CYBER ENGINE · TRAIN"
-            HeadshotEngine.armed -> "CYBER ENGINE · ARMED"
-            else -> "CYBER ENGINE"
-        }
+        content.addView(small("SNAP NOW") { AimService.snapNow() })
+        content.addView(small("GAIN  %.2f".format(AimService.gain)) {
+            AimService.gain = (AimService.gain + 0.1f).coerceAtMost(3f); rebuild()
+        })
+        content.addView(small("STRENGTH  %.2f".format(AimService.strength)) {
+            AimService.strength = (AimService.strength + 0.1f).coerceAtMost(1f); rebuild()
+        })
+        content.addView(small("RADIUS  %.2f".format(AimService.radiusFrac)) {
+            AimService.radiusFrac = (AimService.radiusFrac + 0.04f).coerceAtMost(0.6f); rebuild()
+        })
+        content.addView(small("DEADZONE  %.0f".format(AimService.deadzone)) {
+            AimService.deadzone = (AimService.deadzone + 2f).coerceAtMost(40f); rebuild()
+        })
+        content.addView(small("HEAD BIAS  %.2f".format(AimService.headBias)) {
+            AimService.headBias = (AimService.headBias + 0.04f).coerceAtMost(0.5f); rebuild()
+        })
+        content.addView(small("RESET TUNE") {
+            AimService.gain = 1f; AimService.strength = 0.8f
+            AimService.radiusFrac = 0.28f; AimService.deadzone = 4f; AimService.headBias = 0.12f
+            rebuild()
+        })
     }
 
     private val refresh = object : Runnable {
-        override fun run() { refreshTexts(); ui.postDelayed(this, 500) }
+        override fun run() {
+            header.text = "CYBER AIM · ${if (AimService.enabled) "ON" else "OFF"}"
+            infoText.text = buildString {
+                append("fps ${AimService.frames}\n")
+                append("target ${AimService.seen}  aims ${AimService.aims}\n")
+                append("d(${AimService.lastDx},${AimService.lastDy})  gain %.2f\n".format(AimService.gain))
+                append("shizuku ${if (ShizukuHelper.ready) "ok" else "no"}\n")
+                append("ovl ${if (overlayError == "-") "ok" else overlayError}")
+            }
+            ui.postDelayed(this, 500)
+        }
     }
 
     override fun onDestroy() {
