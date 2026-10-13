@@ -42,6 +42,10 @@ class AimService : Service() {
 
         var pendingCode = 0
         var pendingData: Intent? = null
+
+        // one-shot snap request: written by the overlay, consumed by tick()
+        @Volatile private var snapping = false
+        fun snapNow() { snapping = true }
     }
 
     private var projection: MediaProjection? = null
@@ -55,7 +59,6 @@ class AimService : Service() {
     private var pixels: IntArray? = null
     @Volatile private var fresh = false
     private var lastInject = 0L
-    private var snapping = false
 
     private val ui = Handler(Looper.getMainLooper())
 
@@ -119,6 +122,11 @@ class AimService : Service() {
 
     private fun tick() {
         val px = pixels ?: return
+
+        // consume a pending SNAP NOW (one-shot)
+        val snap = snapping
+        snapping = false
+
         val head = findHead(px)
         if (head == null) { seen = 0; return }
         seen = 1
@@ -129,11 +137,11 @@ class AimService : Service() {
         val dy = (head.second - cy) * scaleY
 
         val radius = realW * radiusFrac
-        if (!snapping && dx * dx + dy * dy > radius * radius) return
+        if (!snap && dx * dx + dy * dy > radius * radius) return
 
         val ax = dx * gain * strength
         val ay = dy * gain * strength
-        if (!snapping && abs(ax) < deadzone && abs(ay) < deadzone) return
+        if (!snap && abs(ax) < deadzone && abs(ay) < deadzone) return
 
         lastDx = ax.toInt(); lastDy = ay.toInt()
         val ox = realW * 0.72f
@@ -200,8 +208,6 @@ class AimService : Service() {
         val headY = minY * cell + ((maxY - minY + 1) * cell * headBias)
         return headX to headY
     }
-
-    fun snapNow() { snapping = true; tick(); snapping = false }
 
     private fun notif(): Notification {
         val nm = getSystemService(NOTIFICATION_SERVICE) as NotificationManager
