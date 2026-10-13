@@ -1,6 +1,9 @@
 package com.example.ffcapture
 
+import java.io.BufferedOutputStream
+import java.io.File
 import java.io.FileOutputStream
+import java.io.OutputStream
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 
@@ -17,15 +20,14 @@ import java.nio.ByteOrder
  *   int   length
  *   byte[length] payload   <- verbatim
  */
-class PayloadDumper(private val out: FileOutputStream) {
+class PayloadDumper(file: File) {
 
+    private val out: OutputStream = BufferedOutputStream(FileOutputStream(file), 1 shl 16)
     private val lock = Any()
+    private var sinceFlush = 0
 
     init {
-        synchronized(lock) {
-            out.write("FFRAW1".toByteArray())
-            out.flush()
-        }
+        synchronized(lock) { out.write("FFRAW1".toByteArray()) }
     }
 
     fun write(dir: Direction, proto: Int, srcPort: Int, dstPort: Int,
@@ -40,11 +42,17 @@ class PayloadDumper(private val out: FileOutputStream) {
         synchronized(lock) {
             out.write(h.array())
             out.write(payload, off, len)
-            out.flush()
+            if (++sinceFlush >= 64) {
+                out.flush()
+                sinceFlush = 0
+            }
         }
     }
 
     fun close() {
-        synchronized(lock) { out.flush(); out.close() }
+        synchronized(lock) {
+            runCatching { out.flush() }
+            runCatching { out.close() }
+        }
     }
 }
