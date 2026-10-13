@@ -83,10 +83,16 @@ object PacketUtils {
         return p
     }
 
+    /**
+     * Builds a TCP segment inside an IPv4 packet.
+     * Pass mss > 0 to append a 4-byte MSS option (SYN / SYN-ACK only).
+     */
     fun buildTcp(srcIp: Int, dstIp: Int, srcPort: Int, dstPort: Int,
                  seq: Int, ack: Int, flags: Int,
-                 payload: ByteArray?, off: Int, len: Int): ByteArray {
-        val total = 20 + 20 + len
+                 payload: ByteArray?, off: Int, len: Int, mss: Int = 0): ByteArray {
+        val optLen = if (mss > 0) 4 else 0
+        val tcpHdr = 20 + optLen
+        val total = 20 + tcpHdr + len
         val p = ByteArray(total)
         p[0] = 0x45
         writeShort(p, 2, total)
@@ -100,11 +106,17 @@ object PacketUtils {
         writeShort(p, 22, dstPort)
         writeInt(p, 24, seq)
         writeInt(p, 28, ack)
-        p[32] = 0x50
+        p[32] = ((tcpHdr / 4) shl 4).toByte()
         p[33] = flags.toByte()
         writeShort(p, 34, 65535)
-        if (len > 0 && payload != null) System.arraycopy(payload, off, p, 40, len)
-        writeShort(p, 36, checksum(p, 20, 20 + len, pseudoSum(srcIp, dstIp, 6, 20 + len)))
+        if (mss > 0) {
+            p[40] = 2
+            p[41] = 4
+            writeShort(p, 42, mss)
+        }
+        if (len > 0 && payload != null) System.arraycopy(payload, off, p, 20 + tcpHdr, len)
+        writeShort(p, 20 + 16,
+            checksum(p, 20, tcpHdr + len, pseudoSum(srcIp, dstIp, 6, tcpHdr + len)))
         return p
     }
 }
