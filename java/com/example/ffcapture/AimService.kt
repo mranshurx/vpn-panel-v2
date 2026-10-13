@@ -256,4 +256,44 @@ class AimService : Service() {
     /** Adopt the most saturated pixel near the crosshair as the outline colour. */
     private fun pick() {
         val px = pixels ?: return
-        val box = 
+        val box = 24
+        val cx = w / 2; val cy = h / 2
+        var bestSat = -1
+        var best = 0
+        for (y in (cy - box).coerceAtLeast(0) until (cy + box).coerceAtMost(h)) {
+            for (x in (cx - box).coerceAtLeast(0) until (cx + box).coerceAtMost(w)) {
+                val c = px[y * w + x]
+                val r = (c shr 16) and 0xFF
+                val g = (c shr 8) and 0xFF
+                val b = c and 0xFF
+                val sat = maxOf(r, g, b) - minOf(r, g, b)
+                if (sat > bestSat) { bestSat = sat; best = c }
+            }
+        }
+        if (bestSat > 40) {
+            target = best or 0xFF000000.toInt()
+            tol = 45
+        }
+    }
+
+    private fun notif(): Notification {
+        val nm = getSystemService(NOTIFICATION_SERVICE) as NotificationManager
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            nm.createNotificationChannel(
+                NotificationChannel("cyberaim", "CYBER AIM", NotificationManager.IMPORTANCE_LOW))
+        }
+        return Notification.Builder(this, "cyberaim")
+            .setContentTitle("CYBER AIM")
+            .setSmallIcon(android.R.drawable.ic_menu_view)
+            .setOngoing(true)
+            .build()
+    }
+
+    override fun onDestroy() {
+        runCatching { vd?.release() }
+        runCatching { reader?.close() }
+        runCatching { projection?.stop() }
+        running = false
+        super.onDestroy()
+    }
+}
