@@ -1,6 +1,9 @@
 package com.example.ffcapture
 
-import android.app.*
+import android.app.Notification
+import android.app.NotificationChannel
+import android.app.NotificationManager
+import android.app.PendingIntent
 import android.content.Intent
 import android.net.VpnService
 import android.os.Build
@@ -9,7 +12,11 @@ import androidx.core.app.NotificationCompat
 import java.io.File
 import java.io.FileInputStream
 import java.io.FileOutputStream
-import java.net.*
+import java.net.DatagramPacket
+import java.net.DatagramSocket
+import java.net.InetAddress
+import java.net.InetSocketAddress
+import java.net.Socket
 import java.util.concurrent.ConcurrentHashMap
 import kotlin.concurrent.thread
 
@@ -21,31 +28,34 @@ class CaptureVpnService : VpnService() {
         private const val CH = "ffcap"
         private const val NOTIF_ID = 1
         val FF_PACKAGES = listOf("com.dts.freefireth", "com.dts.freefiremax")
-        @Volatile var packetCount = 0L
     }
 
     private var tun: ParcelFileDescriptor? = null
     private var tin: FileInputStream? = null
     private var tout: FileOutputStream? = null
     private var pcap: PcapWriter? = null
+
     @Volatile private var running = false
     private val outLock = Any()
 
     private val udpFlows = ConcurrentHashMap<String, UdpFlow>()
     private val tcpFlows = ConcurrentHashMap<String, TcpFlow>()
 
-    // ---- v2 lives here ----
     private val transformer: PacketTransformer = NoOpTransformer
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        if (intent?.action == ACTION_STOP) { shutdown(); return START_NOT_STICKY }
+        if (intent?.action == ACTION_STOP) {
+            shutdown()
+            return START_NOT_STICKY
+        }
         startCapture()
         return START_STICKY
     }
 
     private fun startCapture() {
         if (running) return
-        startForeground(NOTIF_ID, notification("Capturing Free Fire packets"))
+
+        startForeground(NOTIF_ID, buildNotification("Capturing Free Fire packets"))
 
         val b = Builder()
             .setSession("FF Capture")
@@ -56,17 +66,22 @@ class CaptureVpnService : VpnService() {
             .addDnsServer("8.8.8.8")
 
         val installed = FF_PACKAGES.filter { isInstalled(it) }
-        if (installed.isNotEmpty()) installed.forEach { b.addAllowedApplication(it) }
-        // else: capture everything
+        if (installed.isNotEmpty()) {
+            installed.forEach { b.addAllowedApplication(it) }
+        }
 
-        val pfd = b.establish() ?: run {
-            stopForeground(STOP_FOREGROUND_REMOVE); return
+        val pfd = b.establish()
+        if (pfd == null) {
+            stopForeground(STOP_FOREGROUND_REMOVE)
+            stopSelf()
+            return
         }
         tun = pfd
         tin = FileInputStream(pfd.fileDescriptor)
         tout = FileOutputStream(pfd.fileDescriptor)
 
-        val dir = File(getExternalFilesDir(null), "captures").apply { mkdirs() }
+        val dir = File(getExternalFilesDir(null), "captures")
+        dir.mkdirs()
         val f = File(dir, "ff_${System.currentTimeMillis()}.pcap")
         pcap = PcapWriter(FileOutputStream(f))
         CaptureState.currentFile = f.absolutePath
@@ -82,10 +97,9 @@ class CaptureVpnService : VpnService() {
         while (running) {
             val n = try { inS.read(buf) } catch (e: Exception) { break }
             if (n <= 0) continue
-            val ts = System.currentTimeMillis()
-            pcap?.writePacket(buf, n, ts)
-            packetCount++; CaptureState.count = packetCount
-            try { route(buf, n) } catch (e: Exception) { /* keep going */ }
+            pcap?.writePacket(buf, n, System.currentTimeMillis())
+            CaptureState.count++
+            try { route(buf, n) } catch (e: Exception) { }
         }
     }
 
@@ -115,9 +129,10 @@ class CaptureVpnService : VpnService() {
             val sock = DatagramSocket()
             protect(sock)
             sock.connect(InetAddress.getByAddress(PacketUtils.toBytes(dstIp)), dp)
-            flow = UdpFlow(sock, srcIp, sp, dstIp, dp)
-            udpFlows[key] = flow
-            thread { udpReader(flow!!) }
+            val nf = UdpFlow(sock, srcIp, sp, dstIp, dp)
+            udpFlows[key] = nf
+            flow = nf
+            thread { udpReader(nf) }
         }
         val payload = p.copyOfRange(off, off + len)
         flow.socket.send(DatagramPacket(payload, payload.size))
@@ -137,7 +152,7 @@ class CaptureVpnService : VpnService() {
         }
     }
 
-    // ---------------- TCP (compact relay) ----------------
+    // ---------------- TCP ----------------
 
     private fun handleTcp(p: ByteArray, n: Int) {
         val hl = PacketUtils.ipHeaderLen(p)
@@ -151,8 +166,9 @@ class CaptureVpnService : VpnService() {
         val poff = hl + dataOff
         val plen = PacketUtils.totalLength(p) - hl - dataOff
 
+        val SYN = 0x02; val ACK = 0x10; val FIN = 0x01; val RST = 0x04
+
         val key = "$srcIp:$sp-$dstIp:$dp"
-        val SYN = 0x02; val ACK = 0x10; val FIN = 0x01; val RST = 0x04; val PSH = 0x08
 
         if (flags and SYN != 0 && flags and ACK == 0) {
             val sock = Socket()
@@ -182,15 +198,18 @@ class CaptureVpnService : VpnService() {
 
         val flow = tcpFlows[key] ?: return
 
-        if (flags and RST != 0) { flow.socket.close(); tcpFlows.remove(key); return }
+        if (flags and RST != 0) {
+            try { flow.socket.close() } catch (e: Exception) { }
+            tcpFlows.remove(key)
+            return
+        }
 
         if (plen > 0) {
-            // retransmit guard
             if (seq != flow.theirSeq) {
                 sendAck(flow, ACK, dstIp, srcIp, dp, sp)
                 return
             }
-            try { flow.socket.getOutputStream().write(p, poff, plen) } catch (e: Exception) {}
+            try { flow.socket.getOutputStream().write(p, poff, plen) } catch (e: Exception) { }
             flow.theirSeq += plen
             sendAck(flow, ACK, dstIp, srcIp, dp, sp)
         }
@@ -199,15 +218,14 @@ class CaptureVpnService : VpnService() {
             flow.theirSeq++
             sendAck(flow, ACK or FIN, dstIp, srcIp, dp, sp)
             flow.ourSeq++
-            try { flow.socket.close() } catch (e: Exception) {}
+            try { flow.socket.close() } catch (e: Exception) { }
             tcpFlows.remove(key)
         }
     }
 
     private fun sendAck(flow: TcpFlow, flags: Int, srcIp: Int, dstIp: Int, sp: Int, dp: Int) {
-        val pkt = PacketUtils.buildTcp(srcIp, dstIp, sp, dp,
-            flow.ourSeq, flow.theirSeq, flags, null, 0, 0)
-        writeToTun(pkt)
+        writeToTun(PacketUtils.buildTcp(srcIp, dstIp, sp, dp,
+            flow.ourSeq, flow.theirSeq, flags, null, 0, 0))
     }
 
     private fun tcpServerReader(flow: TcpFlow, key: String) {
@@ -219,13 +237,13 @@ class CaptureVpnService : VpnService() {
                 if (r < 0) break
                 if (r == 0) continue
                 var pkt = PacketUtils.buildTcp(flow.dstIp, flow.srcIp, flow.dstPort, flow.srcPort,
-                    flow.ourSeq, flow.theirSeq, 0x18 /*PSH|ACK*/, buf, 0, r)
+                    flow.ourSeq, flow.theirSeq, 0x18, buf, 0, r)
                 pkt = transformer.mutate(pkt, pkt.size, Direction.INBOUND)
                 flow.ourSeq += r
                 pcap?.writePacket(pkt, pkt.size, System.currentTimeMillis())
                 writeToTun(pkt)
             }
-        } catch (e: Exception) {}
+        } catch (e: Exception) { }
         tcpFlows.remove(key)
     }
 
@@ -233,36 +251,47 @@ class CaptureVpnService : VpnService() {
 
     private fun writeToTun(pkt: ByteArray) {
         val o = tout ?: return
-        synchronized(outLock) { try { o.write(pkt) } catch (e: Exception) {} }
+        synchronized(outLock) { try { o.write(pkt) } catch (e: Exception) { } }
     }
 
     private fun isInstalled(pkg: String) =
         try { packageManager.getPackageInfo(pkg, 0); true } catch (e: Exception) { false }
 
-    private fun notification(text: String): Notification {
-        val ch = ChannelBuilder(CH, "FF Capture")
-        (getSystemService(NOTIFICATION_SERVICE) as NotificationManager).createNotificationChannel(ch)
+    private fun buildNotification(text: String): Notification {
+        val nm = getSystemService(NOTIFICATION_SERVICE) as NotificationManager
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            nm.createNotificationChannel(
+                NotificationChannel(CH, "FF Capture", NotificationManager.IMPORTANCE_LOW))
+        }
+        val pi = PendingIntent.getActivity(
+            this, 0,
+            Intent(this, MainActivity::class.java),
+            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT)
         return NotificationCompat.Builder(this, CH)
             .setContentTitle("FF Capture")
             .setContentText(text)
             .setSmallIcon(android.R.drawable.stat_sys_download)
+            .setContentIntent(pi)
             .setOngoing(true)
             .build()
     }
 
     private fun shutdown() {
         running = false
-        udpFlows.values.forEach { try { it.socket.close() } catch (e: Exception) {} }
-        tcpFlows.values.forEach { try { it.socket.close() } catch (e: Exception) {} }
+        udpFlows.values.forEach { try { it.socket.close() } catch (e: Exception) { } }
+        tcpFlows.values.forEach { try { it.socket.close() } catch (e: Exception) { } }
         udpFlows.clear(); tcpFlows.clear()
-        try { pcap?.close() } catch (e: Exception) {}
-        try { tun?.close() } catch (e: Exception) {}
+        try { pcap?.close() } catch (e: Exception) { }
+        try { tun?.close() } catch (e: Exception) { }
         tun = null; pcap = null; tin = null; tout = null
         stopForeground(STOP_FOREGROUND_REMOVE)
         stopSelf()
     }
 
-    override fun onDestroy() { super.onDestroy(); if (running) shutdown() }
+    override fun onDestroy() {
+        super.onDestroy()
+        if (running) shutdown()
+    }
 
     class UdpFlow(val socket: DatagramSocket, val srcIp: Int, val srcPort: Int,
                   val dstIp: Int, val dstPort: Int)
