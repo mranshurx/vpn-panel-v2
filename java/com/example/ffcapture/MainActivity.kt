@@ -28,7 +28,6 @@ class MainActivity : Activity() {
         }
         status = TextView(this).apply { textSize = 15f }
         toggle = Button(this).apply { text = "START CAPTURE" }
-
         val share = Button(this).apply { text = "SHARE LAST .PCAP" }
 
         root.addView(toggle)
@@ -38,16 +37,20 @@ class MainActivity : Activity() {
 
         toggle.setOnClickListener {
             val prep = VpnService.prepare(this)
-            if (prep != null) startActivityForResult(prep, 1)
-            else startService(Intent(this, CaptureVpnService::class.java)
-                .setAction(CaptureVpnService.ACTION_START))
+            if (prep != null) {
+                startActivityForResult(prep, 1)
+            } else {
+                startService(Intent(this, CaptureVpnService::class.java)
+                    .setAction(CaptureVpnService.ACTION_START))
+            }
         }
 
         share.setOnClickListener { shareLast() }
 
         ui.post(object : Runnable {
             override fun run() {
-                status.text = "packets: ${CaptureState.count}\nfile: ${CaptureState.currentFile ?: "-"}"
+                status.text =
+                    "packets: ${CaptureState.count}\nfile: ${CaptureState.currentFile ?: "-"}"
                 ui.postDelayed(this, 500)
             }
         })
@@ -57,12 +60,20 @@ class MainActivity : Activity() {
         val path = CaptureState.currentFile ?: return
         val f = File(path)
         if (!f.exists()) return
-        val uri: Uri = FileProvider.getUriForFile(this, "$packageName.files", f)
+
+        val uri: Uri = FileProvider.getUriForFile(
+            this,
+            "${BuildConfig.APPLICATION_ID}.files",   // <- matches manifest authority
+            f
+        )
+
         startActivity(Intent.createChooser(
             Intent(Intent.ACTION_SEND).apply {
                 type = "application/octet-stream"
                 putExtra(Intent.EXTRA_STREAM, uri)
                 addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
-            }, "Share capture"))
+            },
+            "Share capture"
+        ))
     }
 }
