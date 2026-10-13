@@ -1,19 +1,21 @@
 package com.example.ffcapture
 
-import android.app.Activity
+import android.Manifest
 import android.content.Intent
 import android.net.Uri
 import android.net.VpnService
+import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
 import android.widget.Button
 import android.widget.LinearLayout
 import android.widget.TextView
+import androidx.appcompat.app.AppCompatActivity
 import androidx.core.content.FileProvider
 import java.io.File
 
-class MainActivity : Activity() {
+class MainActivity : AppCompatActivity() {
 
     private lateinit var status: TextView
     private lateinit var toggle: Button
@@ -34,6 +36,10 @@ class MainActivity : Activity() {
         root.addView(share)
         root.addView(status)
         setContentView(root)
+
+        if (Build.VERSION.SDK_INT >= 33) {
+            requestPermissions(arrayOf(Manifest.permission.POST_NOTIFICATIONS), 2)
+        }
 
         toggle.setOnClickListener {
             val prep = VpnService.prepare(this)
@@ -63,7 +69,7 @@ class MainActivity : Activity() {
 
         val uri: Uri = FileProvider.getUriForFile(
             this,
-            "${BuildConfig.APPLICATION_ID}.files",   // <- matches manifest authority
+            "${BuildConfig.APPLICATION_ID}.files",
             f
         )
 
