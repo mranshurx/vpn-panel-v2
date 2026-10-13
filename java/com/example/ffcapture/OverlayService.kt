@@ -33,6 +33,18 @@ class OverlayService : Service() {
 
     private val ui = Handler(Looper.getMainLooper())
 
+    // Wrapping ladders so every knob can be dialled both ways.
+    private val GAIN     = floatArrayOf(0.2f, 0.3f, 0.4f, 0.6f, 0.8f, 1.0f, 1.2f, 1.5f, 2.0f, 2.5f, 3.0f)
+    private val STRENGTH = floatArrayOf(0.2f, 0.3f, 0.4f, 0.5f, 0.6f, 0.7f, 0.8f, 0.9f, 1.0f)
+    private val RADIUS   = floatArrayOf(0.05f, 0.08f, 0.12f, 0.18f, 0.25f, 0.35f, 0.45f, 0.6f)
+    private val DEADZONE = floatArrayOf(0f, 1f, 2f, 3f, 4f, 6f, 8f, 12f, 20f, 30f, 40f)
+    private val HEADBIAS = floatArrayOf(0f, 0.05f, 0.10f, 0.15f, 0.20f, 0.30f, 0.40f, 0.50f)
+
+    private fun next(cur: Float, ladder: FloatArray): Float {
+        for (v in ladder) if (v > cur + 0.001f) return v
+        return ladder[0]
+    }
+
     override fun onBind(i: Intent?): IBinder? = null
 
     override fun onStartCommand(i: Intent?, f: Int, s: Int): Int {
@@ -166,27 +178,30 @@ class OverlayService : Service() {
         content.visibility = View.VISIBLE
 
         content.addView(small("SNAP NOW") { AimService.snapNow() })
+        content.addView(small("PICK COLOUR  #%06X".format(AimService.target and 0xFFFFFF)) {
+            AimService.pickColour(); rebuild()
+        })
         content.addView(small("GAIN  %.2f".format(AimService.gain)) {
-            AimService.gain = (AimService.gain + 0.1f).coerceAtMost(3f); rebuild()
+            AimService.gain = next(AimService.gain, GAIN); rebuild()
         })
         content.addView(small("STRENGTH  %.2f".format(AimService.strength)) {
-            AimService.strength = (AimService.strength + 0.1f).coerceAtMost(1f); rebuild()
+            AimService.strength = next(AimService.strength, STRENGTH); rebuild()
         })
         content.addView(small("RADIUS  %.2f".format(AimService.radiusFrac)) {
-            AimService.radiusFrac = (AimService.radiusFrac + 0.04f).coerceAtMost(0.6f); rebuild()
+            AimService.radiusFrac = next(AimService.radiusFrac, RADIUS); rebuild()
         })
         content.addView(small("DEADZONE  %.0f".format(AimService.deadzone)) {
-            AimService.deadzone = (AimService.deadzone + 2f).coerceAtMost(40f); rebuild()
+            AimService.deadzone = next(AimService.deadzone, DEADZONE); rebuild()
         })
         content.addView(small("HEAD BIAS  %.2f".format(AimService.headBias)) {
-            AimService.headBias = (AimService.headBias + 0.04f).coerceAtMost(0.5f); rebuild()
+            AimService.headBias = next(AimService.headBias, HEADBIAS); rebuild()
         })
         content.addView(small("RESET TUNE") {
             AimService.gain = 1f
             AimService.strength = 0.8f
             AimService.radiusFrac = 0.28f
             AimService.deadzone = 4f
-            AimService.headBias = 0.12f
+            AimService.headBias = 0.10f
             rebuild()
         })
     }
@@ -198,6 +213,7 @@ class OverlayService : Service() {
                 append("fps ${AimService.frames}\n")
                 append("target ${AimService.seen}  aims ${AimService.aims}\n")
                 append("d(${AimService.lastDx},${AimService.lastDy})  gain %.2f\n".format(AimService.gain))
+                append("tol ${AimService.tol}\n")
                 append("shizuku ${if (ShizukuHelper.ready) "ok" else "no"}\n")
                 append("ovl ${if (overlayError == "-") "ok" else overlayError}")
             }
