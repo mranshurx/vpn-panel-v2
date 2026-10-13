@@ -131,11 +131,12 @@ class CaptureVpnService : VpnService() {
             sock.connect(InetAddress.getByAddress(PacketUtils.toBytes(dstIp)), dp)
             val nf = UdpFlow(sock, srcIp, sp, dstIp, dp)
             udpFlows[key] = nf
-            flow = nf
             thread { udpReader(nf) }
+            flow = nf
         }
+        val f = flow!!
         val payload = p.copyOfRange(off, off + len)
-        flow.socket.send(DatagramPacket(payload, payload.size))
+        f.socket.send(DatagramPacket(payload, payload.size))
     }
 
     private fun udpReader(flow: UdpFlow) {
@@ -166,11 +167,14 @@ class CaptureVpnService : VpnService() {
         val poff = hl + dataOff
         val plen = PacketUtils.totalLength(p) - hl - dataOff
 
-        val SYN = 0x02; val ACK = 0x10; val FIN = 0x01; val RST = 0x04
+        val SYN = 0x02
+        val ACK = 0x10
+        val FIN = 0x01
+        val RST = 0x04
 
         val key = "$srcIp:$sp-$dstIp:$dp"
 
-        if (flags and SYN != 0 && flags and ACK == 0) {
+        if ((flags and SYN) != 0 && (flags and ACK) == 0) {
             val sock = Socket()
             protect(sock)
             val flow = TcpFlow(sock, srcIp, sp, dstIp, dp)
@@ -198,7 +202,7 @@ class CaptureVpnService : VpnService() {
 
         val flow = tcpFlows[key] ?: return
 
-        if (flags and RST != 0) {
+        if ((flags and RST) != 0) {
             try { flow.socket.close() } catch (e: Exception) { }
             tcpFlows.remove(key)
             return
@@ -214,7 +218,7 @@ class CaptureVpnService : VpnService() {
             sendAck(flow, ACK, dstIp, srcIp, dp, sp)
         }
 
-        if (flags and FIN != 0) {
+        if ((flags and FIN) != 0) {
             flow.theirSeq++
             sendAck(flow, ACK or FIN, dstIp, srcIp, dp, sp)
             flow.ourSeq++
@@ -280,10 +284,14 @@ class CaptureVpnService : VpnService() {
         running = false
         udpFlows.values.forEach { try { it.socket.close() } catch (e: Exception) { } }
         tcpFlows.values.forEach { try { it.socket.close() } catch (e: Exception) { } }
-        udpFlows.clear(); tcpFlows.clear()
+        udpFlows.clear()
+        tcpFlows.clear()
         try { pcap?.close() } catch (e: Exception) { }
         try { tun?.close() } catch (e: Exception) { }
-        tun = null; pcap = null; tin = null; tout = null
+        tun = null
+        pcap = null
+        tin = null
+        tout = null
         stopForeground(STOP_FOREGROUND_REMOVE)
         stopSelf()
     }
