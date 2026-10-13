@@ -30,10 +30,14 @@ class MainActivity : AppCompatActivity() {
         }
         status = TextView(this).apply { textSize = 15f }
         toggle = Button(this).apply { text = "START CAPTURE" }
+        val scopeBtn = Button(this).apply { text = "SCOPE: FREE FIRE / ALL APPS" }
         val share = Button(this).apply { text = "SHARE LAST .PCAP" }
+        val shareRaw = Button(this).apply { text = "SHARE RAW PAYLOADS (.FFP)" }
 
         root.addView(toggle)
+        root.addView(scopeBtn)
         root.addView(share)
+        root.addView(shareRaw)
         root.addView(status)
         setContentView(root)
 
@@ -51,19 +55,28 @@ class MainActivity : AppCompatActivity() {
             }
         }
 
-        share.setOnClickListener { shareLast() }
+        scopeBtn.setOnClickListener {
+            CaptureVpnService.onlyFreeFire = !CaptureVpnService.onlyFreeFire
+        }
+
+        share.setOnClickListener { share(CaptureState.currentFile, "Share capture") }
+        shareRaw.setOnClickListener { share(CaptureState.currentDumpFile, "Share raw payloads") }
 
         ui.post(object : Runnable {
             override fun run() {
-                status.text =
-                    "packets: ${CaptureState.count}\nfile: ${CaptureState.currentFile ?: "-"}"
+                status.text = buildString {
+                    append("scope: ${CaptureState.scope}\n")
+                    append("packets: ${CaptureState.count}\n")
+                    append("pcap: ${CaptureState.currentFile ?: "-"}\n")
+                    append("raw: ${CaptureState.currentDumpFile ?: "-"}")
+                }
                 ui.postDelayed(this, 500)
             }
         })
     }
 
-    private fun shareLast() {
-        val path = CaptureState.currentFile ?: return
+    private fun share(path: String?, label: String) {
+        if (path == null) return
         val f = File(path)
         if (!f.exists()) return
 
@@ -79,7 +92,7 @@ class MainActivity : AppCompatActivity() {
                 putExtra(Intent.EXTRA_STREAM, uri)
                 addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
             },
-            "Share capture"
+            label
         ))
     }
 }
